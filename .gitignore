@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Downloaded on first run by spidergame/vision/models.py
+models/
+
+# Per-machine, per-player thresholds — deliberately not shared
+calibration.json
