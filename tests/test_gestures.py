@@ -4,13 +4,19 @@ from types import SimpleNamespace
 
 from spidergame.vision.gestures import (
     AMBIGUOUS,
+    AimSmoother,
     EXTENDED,
     FOLDED,
     FINGERS,
     PoseLatch,
+    THWIP_ACQUIRE_CONFIDENCE,
+    THWIP_HOLD_CONFIDENCE,
+    ThwipLatch,
+    finger_straightness,
     finger_states,
     is_fist,
     is_thwip,
+    thwip_confidence,
 )
 from spidergame.vision.worker import VisionWorker
 
@@ -130,6 +136,33 @@ class FingerGeometryTests(unittest.TestCase):
         self.assertFalse(is_thwip(finger_states(fist)))
         self.assertTrue(is_fist(finger_states(fist)))
 
+    def test_continuous_confidence_accepts_naturally_bent_outer_fingers(self):
+        pose = _hand({
+            "index": "ambiguous",
+            "middle": "folded",
+            "ring": "folded",
+            "pinky": "ambiguous",
+        })
+
+        ratios = finger_straightness(pose)
+        confidence = thwip_confidence(ratios)
+
+        # The old three-state classifier calls the outer fingers ambiguous,
+        # but their continuous ratios still form a strong natural pose.
+        self.assertEqual(finger_states(pose)["index"], AMBIGUOUS)
+        self.assertGreaterEqual(confidence, THWIP_ACQUIRE_CONFIDENCE)
+        self.assertLess(confidence, 1.0)
+
+    def test_degenerate_landmarks_have_zero_pose_confidence(self):
+        pose = [(0.0, 0.0, 0.0) for _ in range(21)]
+        ratios = finger_straightness(pose)
+
+        self.assertTrue(all(value is None for value in ratios.values()))
+        self.assertEqual(thwip_confidence(ratios), 0.0)
+        self.assertTrue(all(
+            state == AMBIGUOUS for state in finger_states(pose).values()
+        ))
+
 
 class PoseLatchTests(unittest.TestCase):
     def test_brief_tracking_blink_does_not_release_web(self):
@@ -148,6 +181,60 @@ class PoseLatchTests(unittest.TestCase):
         self.assertTrue(latch.update(False, 2.222))
         self.assertTrue(latch.update(False, 2.333))
         self.assertFalse(latch.update(False, 2.444))
+
+
+class ThwipLatchTests(unittest.TestCase):
+    @staticmethod
+    def _confidence(middle_shape="folded", ring_shape="folded"):
+        pose = _hand({
+            "index": "extended",
+            "middle": middle_shape,
+            "ring": ring_shape,
+            "pinky": "extended",
+        })
+        return thwip_confidence(finger_straightness(pose))
+
+    def test_ambiguous_curled_fingers_cannot_acquire_a_web(self):
+        confidence = self._confidence("ambiguous", "ambiguous")
+        latch = ThwipLatch()
+
+        self.assertGreaterEqual(confidence, THWIP_HOLD_CONFIDENCE)
+        self.assertLess(confidence, THWIP_ACQUIRE_CONFIDENCE)
+        self.assertFalse(latch.update(confidence, 1.00))
+        self.assertFalse(latch.update(confidence, 1.20))
+        self.assertFalse(latch.raw)
+
+    def test_ambiguous_curled_fingers_maintain_an_acquired_web(self):
+        strong = self._confidence()
+        occluded = self._confidence("ambiguous", "ambiguous")
+        latch = ThwipLatch()
+
+        self.assertFalse(latch.update(strong, 2.00))
+        self.assertTrue(latch.update(strong, 2.07))
+        self.assertTrue(latch.update(occluded, 2.20))
+        self.assertTrue(latch.update(occluded, 2.50))
+        self.assertTrue(latch.raw)
+
+    def test_clear_pose_loss_uses_release_grace(self):
+        latch = ThwipLatch()
+        latch.update(1.0, 3.00)
+        self.assertTrue(latch.update(1.0, 3.07))
+
+        self.assertTrue(latch.update(0.0, 3.10))
+        self.assertTrue(latch.update(0.0, 3.24))
+        self.assertFalse(latch.update(0.0, 3.27))
+
+
+class AimSmootherTests(unittest.TestCase):
+    def test_time_based_ema_smooths_jitter_and_resets_after_a_gap(self):
+        smoother = AimSmoother(time_constant_s=0.08, reset_gap_s=0.35)
+
+        self.assertEqual(smoother.update(0.0, 0.0, 1.00), (0.0, 0.0))
+        x, y = smoother.update(1.0, 1.0, 1.08)
+        self.assertAlmostEqual(x, 1.0 - math.exp(-1.0), places=6)
+        self.assertAlmostEqual(y, x, places=6)
+
+        self.assertEqual(smoother.update(0.2, 0.3, 1.50), (0.2, 0.3))
 
 
 class VisionWorkerClassificationTests(unittest.TestCase):
@@ -183,6 +270,82 @@ class VisionWorkerClassificationTests(unittest.TestCase):
             self.assertTrue(snapshot.raw_thwip)
             self.assertEqual(snapshot.states["middle"], FOLDED)
             self.assertEqual(snapshot.states["ring"], FOLDED)
+            self.assertEqual(snapshot.thwip_confidence, 1.0)
+            self.assertIn("index", snapshot.straightness)
+        finally:
+            worker.close()
+
+    def test_worker_uses_strict_acquire_then_relaxed_hold(self):
+        image_hand = _hand({name: "extended" for name in FINGERS})
+        strong = _hand({
+            "index": "extended",
+            "middle": "folded",
+            "ring": "folded",
+            "pinky": "extended",
+        })
+        occluded = _hand({
+            "index": "extended",
+            "middle": "ambiguous",
+            "ring": "ambiguous",
+            "pinky": "extended",
+        })
+        worker = VisionWorker()
+
+        def classify(world_hand, now):
+            result = SimpleNamespace(
+                hand_landmarks=[self._mediapipe_hand(image_hand)],
+                hand_world_landmarks=[self._mediapipe_hand(world_hand)],
+            )
+            worker._classify(result, now, 30.0, 30.0, 12.0, None)
+            return worker.snapshot()
+
+        try:
+            snapshot = classify(occluded, 10.00)
+            self.assertTrue(snapshot.raw_thwip)
+            self.assertFalse(snapshot.thwip_candidate)
+            self.assertFalse(snapshot.thwip_held)
+            snapshot = classify(occluded, 10.20)
+            self.assertFalse(snapshot.thwip_held)
+
+            self.assertFalse(classify(strong, 11.00).thwip_held)
+            self.assertTrue(classify(strong, 11.07).thwip_held)
+            snapshot = classify(occluded, 11.20)
+            self.assertTrue(snapshot.thwip_candidate)
+            self.assertTrue(snapshot.thwip_held)
+        finally:
+            worker.close()
+
+    def test_worker_smooths_hand_aim_and_holds_it_when_tracking_is_lost(self):
+        geometry = _hand({
+            "index": "extended",
+            "middle": "folded",
+            "ring": "folded",
+            "pinky": "extended",
+        })
+        worker = VisionWorker()
+
+        def classify_at_x(offset, now):
+            image_hand = [
+                (x + offset, y, z) for x, y, z in geometry
+            ]
+            result = SimpleNamespace(
+                hand_landmarks=[self._mediapipe_hand(image_hand)],
+                hand_world_landmarks=[self._mediapipe_hand(geometry)],
+            )
+            worker._classify(result, now, 30.0, 30.0, 12.0, None)
+            return worker.snapshot()
+
+        try:
+            first = classify_at_x(0.2, 20.00)
+            self.assertAlmostEqual(first.hand_x, 0.2)
+
+            second = classify_at_x(0.8, 20.08)
+            self.assertGreater(second.hand_x, first.hand_x)
+            self.assertLess(second.hand_x, 0.8)
+
+            no_hand = SimpleNamespace(hand_landmarks=[], hand_world_landmarks=[])
+            worker._classify(no_hand, 20.10, 30.0, 30.0, 12.0, None)
+            self.assertEqual(worker.snapshot().hand_x, second.hand_x)
         finally:
             worker.close()
 

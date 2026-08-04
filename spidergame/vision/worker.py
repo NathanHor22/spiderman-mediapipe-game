@@ -33,13 +33,16 @@ import cv2
 
 from .calibration import Calibration
 from .gestures import (
-    PoseLatch,
+    AimSmoother,
     PunchDetector,
-    finger_states,
+    ThwipLatch,
+    finger_straightness,
     is_fist,
     is_thwip,
     palm_centre,
     palm_scale,
+    states_from_straightness,
+    thwip_confidence,
 )
 
 
@@ -66,6 +69,12 @@ class GestureSnapshot:
     capture_fps: float = 0.0
     inference_ms: float = 0.0
     dropped_frames: int = 0
+
+    # Appended to preserve the original positional dataclass constructor.
+    thwip_candidate: bool = False
+    straightness: dict = field(default_factory=dict)
+    thwip_confidence: float = 0.0
+    thwip_threshold: float = 0.0
 
 
 class _CaptureThread(threading.Thread):
@@ -188,7 +197,8 @@ class VisionWorker(threading.Thread):
         self._dropped = 0
 
         self._capture = _CaptureThread(camera_index, width, height)
-        self._thwip_latch = PoseLatch()
+        self._thwip_latch = ThwipLatch()
+        self._aim_smoother = AimSmoother()
         self._punch = PunchDetector(
             growth_threshold=self.calibration.punch_growth_threshold
         )
@@ -375,7 +385,8 @@ class VisionWorker(threading.Thread):
 
         if not hand_lists:
             snap.tracking_lost = True
-            snap.thwip_held = self._thwip_latch.update(False, now)
+            snap.thwip_held = self._thwip_latch.update(0.0, now)
+            snap.thwip_threshold = self._thwip_latch.threshold
             self._punch.reset()
             # Hold the last known hand position rather than snapping to centre —
             # a hand leaving frame should not yank the anchor point across the
@@ -403,21 +414,31 @@ class VisionWorker(threading.Thread):
             and len(world_hand_lists[primary_index]) == len(primary)
         ):
             geometry = world_hand_lists[primary_index]
-        states = finger_states(geometry)
+        straightness = finger_straightness(geometry)
+        states = states_from_straightness(straightness)
+        confidence = thwip_confidence(straightness)
         scale = palm_scale(primary)
         cx, cy = palm_centre(primary)
 
-        raw_thwip = is_thwip(states)
         raw_fist = is_fist(states)
         fired = self._punch.update(raw_fist, scale, now)
 
         snap.tracking_lost = False
-        snap.thwip_held = self._thwip_latch.update(raw_thwip, now)
-        snap.hand_x = min(max(cx, 0.0), 1.0)
-        snap.hand_y = min(max(cy, 0.0), 1.0)
-        snap.raw_thwip = raw_thwip
+        snap.thwip_held = self._thwip_latch.update(confidence, now)
+        cx = min(max(cx, 0.0), 1.0)
+        cy = min(max(cy, 0.0), 1.0)
+        cx, cy = self._aim_smoother.update(cx, cy, now)
+        snap.hand_x = cx
+        snap.hand_y = cy
+        # Preserve raw_thwip's original geometry-only meaning. The candidate
+        # is the confidence gate actually being fed into the temporal latch.
+        snap.raw_thwip = is_thwip(states)
+        snap.thwip_candidate = self._thwip_latch.raw
         snap.raw_fist = raw_fist
         snap.states = states
+        snap.straightness = straightness
+        snap.thwip_confidence = confidence
+        snap.thwip_threshold = self._thwip_latch.threshold
         snap.scale = scale
         snap.growth_rate = self._punch.rate
 

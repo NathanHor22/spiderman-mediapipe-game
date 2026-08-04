@@ -11,7 +11,7 @@ START_SPEED = 52.0
 MAX_SPEED = 128.0
 SPEED_RAMP = 0.55
 SPEED_RESTORE = 1.7
-ATTACHED_SPEED_RESTORE = 0.20
+ATTACHED_SPEED_RESTORE = 0.0
 
 # --- gravity ----------------------------------------------------------------
 # Stronger than earth gravity, but low enough for a taut 25-unit web to complete
@@ -25,6 +25,8 @@ PHYSICS_MAX_STEP = 1.0 / 240.0
 REEL_RATE = 12.0
 MIN_REST = 12.0
 MAX_WEB_RANGE = 95.0
+WEB_REEL_DISTANCE = 6.0
+ANCHOR_SEARCH_WINDOW = 45.0
 
 # The web shooter is powered rather than passive. Attachment gives one bounded
 # impulse along the high cable, then a mild central pull and reel take over.
@@ -32,6 +34,15 @@ MAX_WEB_RANGE = 95.0
 WEB_CATCH_UP_SPEED = 5.0
 WEB_CATCH_MAX_DV = 28.0
 WEB_PULL_ACCEL = 4.0
+WEB_PULL_TIME = 0.35
+# Let go while the character still has useful forward/upward momentum.  The
+# A real cable sweep is its own debounce and must remain responsive as speed
+# rises. The tilt-only path waits longer so a steep initial cable cannot let go
+# immediately; the larger arc cap remains the final anti-orbit fallback.
+AUTO_RELEASE_TILT_MIN_TIME = 0.55
+AUTO_RELEASE_SWEEP_DEG = 55.0
+MAX_SWING_RISE_ANGLE_DEG = 65.0
+MAX_SWING_ARC_DEG = 120.0
 
 # --- anchor placement -------------------------------------------------------
 # Hand x picks the side/reach and hand y picks height. A minimum upward cable

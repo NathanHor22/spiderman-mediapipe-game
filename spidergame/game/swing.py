@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from ..control import ControlState
 from ..render.world import WorldStrip
@@ -33,6 +34,13 @@ def _cross(a, b) -> tuple[float, float, float]:
     )
 
 
+class SwingEvent(Enum):
+    SHOT = auto()
+    ATTACH = auto()
+    MISS = auto()
+    RELEASE = auto()
+
+
 @dataclass
 class Anchor:
     x: float
@@ -40,6 +48,7 @@ class Anchor:
     z: float
     rest_length: float
     taut: bool = True
+    reel_target: float = 0.0
 
 
 class SwingSim:
@@ -68,6 +77,14 @@ class SwingSim:
         # Derived cable state exposed for diagnostics and regression tests.
         self.angular_velocity = (0.0, 0.0, 0.0)
         self.web_tension = 0.0
+        self.web_age = 0.0
+        self.web_arc = 0.0
+        self.release_reason = ""
+        self.shots = 0
+        self.auto_releases = 0
+        self.last_events: tuple[SwingEvent, ...] = ()
+        self._frame_events: list[SwingEvent] = []
+        self._previous_rope_direction: tuple[float, float, float] | None = None
 
     # ---------------------------------------------------------------- web
 
@@ -82,13 +99,27 @@ class SwingSim:
         )
         target_z = self.z + ahead
 
-        building = world.building_near(side, target_z)
-        if building is None:
+        def footprint_distance(building) -> float:
+            if building.z0 <= target_z <= building.z1:
+                return 0.0
+            return min(abs(target_z - building.z0), abs(target_z - building.z1))
+
+        candidates = [
+            building
+            for building in world.buildings
+            if (
+                building.side == side
+                and building.z1 >= self.z + T.ANCHOR_AHEAD_MIN
+                and footprint_distance(building) <= T.ANCHOR_SEARCH_WINDOW
+            )
+        ]
+        candidates.sort(key=lambda building: (
+            footprint_distance(building),
+            -building.height,
+        ))
+        if not candidates:
             self.whiff_reason["no building"] += 1
             return None
-
-        z = max(building.z0, min(target_z, building.z1))
-        ax, az = building.inner_x, z
 
         # A physically accurate line cannot lift from a shallow anchor. Clamp
         # low hand aiming upward while preserving the hand's higher choices.
@@ -96,26 +127,39 @@ class SwingSim:
             T.ANCHOR_HEIGHT_MAX
             + (T.ANCHOR_HEIGHT_MIN - T.ANCHOR_HEIGHT_MAX) * ctrl.hand_y
         )
-        horizontal = math.hypot(ax - self.x, az - self.z)
         slope = T.MIN_ANCHOR_UP_DOT / math.sqrt(
             1.0 - T.MIN_ANCHOR_UP_DOT ** 2
         )
-        min_rise = max(T.ANCHOR_MIN_RISE, horizontal * slope)
-        min_y = self.y + min_rise
-        roof_y = building.height - T.ANCHOR_MIN_CLEARANCE
-        if roof_y < min_y:
-            self.whiff_reason["too low"] += 1
-            return None
-        ay = min(max(want_y, min_y), roof_y)
+        saw_too_low = False
+        saw_out_of_range = False
+        for building in candidates:
+            az = max(building.z0, min(target_z, building.z1))
+            ax = building.inner_x
+            horizontal = math.hypot(ax - self.x, az - self.z)
+            min_rise = max(T.ANCHOR_MIN_RISE, horizontal * slope)
+            min_y = self.y + min_rise
+            roof_y = building.height - T.ANCHOR_MIN_CLEARANCE
+            if roof_y < min_y:
+                saw_too_low = True
+                continue
 
-        dist = math.dist((ax, ay, az), (self.x, self.y, self.z))
-        if dist > T.MAX_WEB_RANGE:
+            ay = min(max(want_y, min_y), roof_y)
+            dist = math.dist((ax, ay, az), (self.x, self.y, self.z))
+            if dist > T.MAX_WEB_RANGE:
+                saw_out_of_range = True
+                continue
+
+            # Start at the real distance. A shorter hard constraint would
+            # teleport the character; the catch supplies the initial yank.
+            return Anchor(ax, ay, az, rest_length=max(T.MIN_REST, dist))
+
+        if saw_out_of_range:
             self.whiff_reason["out of range"] += 1
-            return None
-
-        # Start at the real distance. A shorter hard constraint would teleport
-        # the character; the powered catch supplies the initial yank instead.
-        return Anchor(ax, ay, az, rest_length=max(T.MIN_REST, dist))
+        elif saw_too_low:
+            self.whiff_reason["too low"] += 1
+        else:
+            self.whiff_reason["no building"] += 1
+        return None
 
     def _catch_web(self, anchor: Anchor) -> None:
         """Apply a bounded impulse along the cable with a known upward part."""
@@ -138,6 +182,27 @@ class SwingSim:
         self.vy -= outward[1] * catch_dv
         self.vz -= outward[2] * catch_dv
         anchor.taut = True
+        anchor.reel_target = max(
+            T.MIN_REST,
+            anchor.rest_length - T.WEB_REEL_DISTANCE,
+        )
+        self.web_age = 0.0
+        self.web_arc = 0.0
+        self.release_reason = ""
+        self._previous_rope_direction = outward
+
+    def _detach_web(self, reason: str, *, automatic: bool = False) -> None:
+        """Release without changing velocity, preserving the launch impulse."""
+        if self.anchor is None:
+            return
+        self.anchor = None
+        self.angular_velocity = (0.0, 0.0, 0.0)
+        self.web_tension = 0.0
+        self.release_reason = reason
+        self._previous_rope_direction = None
+        self._frame_events.append(SwingEvent.RELEASE)
+        if automatic:
+            self.auto_releases += 1
 
     # ------------------------------------------------------------- physics
 
@@ -194,6 +259,54 @@ class SwingSim:
         spin = _cross(radius, (self.vx, self.vy, self.vz))
         self.angular_velocity = tuple(component / radius_sq for component in spin)
 
+    def _advance_swing_arc(self, dt: float) -> None:
+        """Track cable sweep and release before a pendulum can complete a loop."""
+        anchor = self.anchor
+        if anchor is None:
+            return
+        radius = (
+            self.x - anchor.x,
+            self.y - anchor.y,
+            self.z - anchor.z,
+        )
+        distance = math.sqrt(_dot(radius, radius))
+        if distance < 1e-6:
+            return
+        direction = tuple(component / distance for component in radius)
+
+        if self._previous_rope_direction is not None:
+            sweep_axis = _cross(self._previous_rope_direction, direction)
+            cross_size = math.sqrt(
+                _dot(sweep_axis, sweep_axis)
+            )
+            dot = max(
+                -1.0,
+                min(1.0, _dot(self._previous_rope_direction, direction)),
+            )
+            self.web_arc += math.atan2(cross_size, dot)
+        self._previous_rope_direction = direction
+        self.web_age += dt
+
+        upward_anchor_fraction = -direction[1]
+        swept_rising_arc = self.web_arc >= math.radians(
+            T.AUTO_RELEASE_SWEEP_DEG
+        )
+        tilted_far_enough = (
+            self.web_age >= T.AUTO_RELEASE_TILT_MIN_TIME
+            and upward_anchor_fraction <= math.cos(
+                math.radians(T.MAX_SWING_RISE_ANGLE_DEG)
+            )
+        )
+        reached_rising_release = (
+            self.vy > 0.0
+            and self.vz > 0.0
+            and (swept_rising_arc or tilted_far_enough)
+        )
+        exceeded_arc = self.web_arc >= math.radians(T.MAX_SWING_ARC_DEG)
+        if reached_rising_release or exceeded_arc:
+            reason = "rise limit" if reached_rising_release else "arc limit"
+            self._detach_web(reason, automatic=True)
+
     def _substep(self, dt: float, target_speed: float) -> None:
         restore = T.SPEED_RESTORE
         if self.anchor is not None:
@@ -232,7 +345,10 @@ class SwingSim:
                 support = max(0.0, _dot(acceleration, outward) + centripetal)
                 powered_pull = (
                     T.WEB_PULL_ACCEL
-                    if anchor.rest_length > T.MIN_REST + 1e-6
+                    if (
+                        self.web_age < T.WEB_PULL_TIME
+                        and anchor.rest_length > anchor.reel_target + 1e-6
+                    )
                     else 0.0
                 )
                 tension = support + powered_pull
@@ -253,7 +369,8 @@ class SwingSim:
 
         if anchor is not None:
             old_length = anchor.rest_length
-            scheduled_length = max(T.MIN_REST, old_length - T.REEL_RATE * dt)
+            reel_floor = max(T.MIN_REST, anchor.reel_target)
+            scheduled_length = max(reel_floor, old_length - T.REEL_RATE * dt)
             radius = (
                 self.x - anchor.x,
                 self.y - anchor.y,
@@ -263,7 +380,7 @@ class SwingSim:
 
             taking_up_real_slack = (
                 T.REEL_RATE > 0.0
-                and old_length > T.MIN_REST
+                and old_length > reel_floor
                 and predicted_distance < scheduled_length - 1e-3
             )
 
@@ -271,7 +388,7 @@ class SwingSim:
                 # The player is approaching faster than the base reel rate.
                 # Let the powered spool follow that motion instead of applying
                 # the outward impulse a passive fixed-length rope would need.
-                anchor.rest_length = max(T.MIN_REST, predicted_distance)
+                anchor.rest_length = max(reel_floor, predicted_distance)
                 anchor.taut = anchor.rest_length <= predicted_distance + 1e-7
             elif constraint_active and predicted_distance > 1e-7:
                 # Positive tension means the analytical motion belongs on the
@@ -301,10 +418,10 @@ class SwingSim:
                 # unpowered cable retains its length and becomes slack.
                 if (
                     T.REEL_RATE > 0.0
-                    and old_length > T.MIN_REST
+                    and old_length > reel_floor
                     and predicted_distance < scheduled_length
                 ):
-                    anchor.rest_length = max(T.MIN_REST, predicted_distance)
+                    anchor.rest_length = max(reel_floor, predicted_distance)
                 else:
                     anchor.rest_length = scheduled_length
 
@@ -348,6 +465,7 @@ class SwingSim:
             self.vy = min(0.0, self.vy)
 
         self._update_angular_velocity()
+        self._advance_swing_arc(dt)
 
         if self.y <= T.STREET_DEATH_Y:
             self.y = T.STREET_DEATH_Y
@@ -356,29 +474,37 @@ class SwingSim:
 
     # --------------------------------------------------------------- update
 
-    def update(self, dt: float, ctrl: ControlState, world: WorldStrip) -> None:
+    def update(
+        self, dt: float, ctrl: ControlState, world: WorldStrip
+    ) -> tuple[SwingEvent, ...]:
+        self._frame_events = []
+        self.last_events = ()
         if not self.alive or dt <= 0.0:
-            return
+            return self.last_events
 
         self.elapsed += dt
         target_speed = min(T.MAX_SPEED, T.START_SPEED + self.elapsed * T.SPEED_RAMP)
 
         # One web per pose. Releasing preserves the instantaneous tangential
-        # launch velocity; passing the anchor is now the rising half of the arc,
-        # not an automatic detach condition.
+        # launch velocity. A rising-angle assist and a swept-arc safety cap may
+        # also release it before the player can orbit the anchor.
         if not ctrl.thwip_held:
-            self.anchor = None
+            if self.anchor is not None:
+                self._detach_web("player release")
             self._armed = True
-            self.angular_velocity = (0.0, 0.0, 0.0)
         elif self.anchor is None and self._armed:
+            self.shots += 1
+            self._frame_events.append(SwingEvent.SHOT)
             found = self._pick_anchor(world, ctrl)
             self._armed = False
             if found is None:
                 self.whiffs += 1
+                self._frame_events.append(SwingEvent.MISS)
             else:
                 self.anchor = found
                 self._catch_web(found)
                 self.attaches += 1
+                self._frame_events.append(SwingEvent.ATTACH)
 
         self.web_tension = 0.0
         steps = max(1, math.ceil(dt / T.PHYSICS_MAX_STEP))
@@ -390,6 +516,8 @@ class SwingSim:
 
         self.peak_y = max(self.peak_y, self.y)
         self.low_y = min(self.low_y, self.y)
+        self.last_events = tuple(self._frame_events)
+        return self.last_events
 
     # ---------------------------------------------------------------- state
 

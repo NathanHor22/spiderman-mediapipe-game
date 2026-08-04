@@ -226,6 +226,8 @@ def main() -> int:
             text, colour = "NO HAND", hud.BAD
         elif snap.thwip_held:
             text, colour = "THWIP", hud.GOOD
+        elif snap.thwip_candidate:
+            text, colour = "LOCKING", hud.WARN
         elif snap.raw_fist:
             text, colour = "FIST", hud.WARN
         else:
@@ -251,6 +253,22 @@ def main() -> int:
         panel.row(screen, "hands", snap.num_hands)
         panel.row(screen, "palm scale", f"{snap.scale:.3f}")
         panel.row(screen, "hand x/y", f"{snap.hand_x:.2f} / {snap.hand_y:.2f}")
+        score_colour = (
+            hud.GOOD if snap.thwip_held else
+            hud.WARN if snap.thwip_candidate else hud.DIM
+        )
+        panel.row(
+            screen,
+            "web score",
+            f"{snap.thwip_confidence:.2f} / {snap.thwip_threshold:.2f}",
+            score_colour,
+        )
+        panel.row(
+            screen,
+            "web gate",
+            "hold" if snap.thwip_held else "acquire",
+            score_colour,
+        )
         panel.gap(14)
 
         hud.draw_text(screen, font, "punch growth", (panel.rect.x + 12, panel.y),
@@ -271,7 +289,9 @@ def main() -> int:
             s = snap.states.get(name, 0)
             txt = "EXTENDED" if s == EXTENDED else "folded" if s == FOLDED else "?"
             col = hud.GOOD if s == EXTENDED else hud.DIM if s == FOLDED else hud.WARN
-            panel.row(screen, name, txt, col)
+            ratio = snap.straightness.get(name)
+            ratio_text = "--" if ratio is None else f"{ratio:.2f}"
+            panel.row(screen, name, f"{txt}  {ratio_text}", col)
 
         hud.draw_text(screen, font,
                       "C calibrate   [ ] threshold   0-3 camera   S save   "

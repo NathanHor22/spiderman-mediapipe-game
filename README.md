@@ -41,6 +41,8 @@ webcam and nothing else changes.
 
 | key | |
 |---|---|
+| `↑` / `↓` or `W` / `S`, then `ENTER` | choose a title-screen action |
+| mouse hover + click | select and activate a title-screen action |
 | hold `SPACE` / left mouse | thwip |
 | mouse position | which side you anchor to, and how high |
 | `X` hold | preview spider-sense slow motion |
@@ -50,14 +52,23 @@ webcam and nothing else changes.
 **One web per thwip.** You must release before firing another, so choosing when
 to let go *is* the game. Without that gate, holding the sign down forever was the
 dominant strategy because a missed shot could retry on every frame. A successful
-web now stays attached through the rising half of the arc until you release it.
+web reels in by a small, fixed amount and pulls upward, then either releases when
+you relax the pose or assists the release near the top of the rising arc. A swept-
+arc safety cap prevents unusual approaches from turning into endless loops.
 
-Flow is title → tutorial → countdown → play, all drawn over a live corridor
-render rather than a flat menu background. The tutorial gates on you actually
-performing each action — hold the sign, let go, then sweep left and right —
-rather than on a timer, so nobody reaches the street still guessing. Losing hand
-tracking deliberately does not satisfy the "let go" step, or you could skip it by
-dropping your hand out of frame.
+The comic-style starting screen has START, TRAINING and QUIT choices over a live
+corridor, plus an aspect-correct camera preview and live hand/gesture status in
+vision mode. START goes directly to the countdown; TRAINING opens the interactive
+lesson. The tutorial gates on you actually performing each action — hold the
+sign, let go, then sweep left and right — rather than on a timer. Losing hand
+tracking deliberately does not satisfy the "let go" step, or you could skip it
+by dropping your hand out of frame. `--skip-tutorial` bypasses the title as well
+and starts at the countdown.
+
+Web shots, catches, misses and releases use procedural sound effects, so there
+are no external audio assets to install. While attached, a looping stereo whoosh
+tracks swing speed, angular velocity, tension and cable slack. If SDL cannot open
+an audio device, the game continues silently instead of failing to start.
 
 ### Camera selection
 
@@ -76,10 +87,10 @@ python run_game.py --vision           # auto-pick
 python run_game.py --vision --camera 1
 ```
 
-Windows device names are shown for orientation and annotated with a built-in vs
-external guess from the USB vendor ID — but that ordering does **not** map to
-OpenCV's capture indices, which is exactly why the choice is visual rather than
-inferred.
+`--list-cameras` prints Windows device names for orientation and annotates a
+built-in vs external guess from the USB vendor ID, but that ordering does **not**
+map to OpenCV's capture indices. The title therefore uses the live preview and
+capture index rather than displaying a misleading name beside it.
 
 
 **`python run_gesture_harness.py`** — the tuning rig. Webcam feed, landmark
@@ -88,7 +99,11 @@ first.
 
 The web-shooter pose is **index + pinky extended, middle + ring curled**. The
 thumb may be open or tucked, and either a palm-facing or back-of-hand view is
-accepted.
+accepted. Detection uses continuous 3D finger-straightness confidence: forming
+the pose has a strict threshold, while an already-held pose gets a relaxed
+threshold so a briefly hidden curled fingertip does not drop the web. Palm aim is
+smoothed with a time-based 80ms filter to remove landmark jitter without adding a
+frame-rate dependency.
 
 | key | |
 |---|---|
@@ -125,6 +140,7 @@ windows, so there is real headroom for physics and entities.
 
 ```
 spidergame/
+  audio.py              procedural web, cable and swing effects
   control.py            ControlState — the seam between input and game
   clock.py              real_dt vs game_dt (time dilation)
   vision/
@@ -178,10 +194,14 @@ gravity's remaining tangential component changes the 3D angular velocity. A
 slack line never pushes the player.
 
 Attachment starts at the real player-to-anchor distance, then a bounded powered
-catch and reel pull the character upward without teleporting them. Anchors are
-clamped to a useful elevation and the buildings span 72-132 units so the raised
-50-unit start still has reliable attachment choices. Passing the anchor no
-longer detaches the line: that is the moment the rising half-arc begins.
+catch and six-unit reel pull the character upward without teleporting them.
+Anchors are clamped to a useful elevation and the buildings span 72-132 units so
+the raised 50-unit start still has reliable attachment choices. If the nearest
+roof is too low, the shot checks a taller neighbouring building before becoming
+a miss. Forward speed is not artificially restored while attached, gravity
+changes the angular velocity, and a forward/upward 55-degree sweep or rope-tilt
+release prevents a full orbit while preserving instantaneous launch velocity. A
+larger swept-arc cap remains as a numerical safety fallback.
 
 ## Open issue: bimodal inference speed
 

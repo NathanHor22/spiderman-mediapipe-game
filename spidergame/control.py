@@ -16,7 +16,8 @@ from typing import Protocol
 class ControlState:
     """One frame of player intent."""
 
-    # Sustained pose. Web is attached for as long as this is true.
+    # Sustained pose intent. It fires once per acquire/release cycle; physics
+    # may assist the release near the top of an otherwise looping swing.
     thwip_held: bool = False
 
     # Palm centre of the primary hand, normalised to the camera frame.

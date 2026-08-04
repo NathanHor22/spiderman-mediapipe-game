@@ -45,6 +45,19 @@ FINGERS = {
 EXTENDED_STRAIGHTNESS = 0.86
 FOLDED_STRAIGHTNESS = 0.80
 
+# Confidence ramps are deliberately wider than the debug-state dead zone. A
+# real pinky is commonly a little bent even in a good web-shooter pose, while a
+# partly hidden curled finger can be reconstructed a little too straight. The
+# continuous score lets the temporal detector be strict while acquiring and
+# forgiving only after a web has genuinely been established.
+EXTENSION_CONFIDENCE_LOW = 0.72
+EXTENSION_CONFIDENCE_HIGH = 0.88
+FOLD_CONFIDENCE_LOW = 0.78
+FOLD_CONFIDENCE_HIGH = 0.90
+
+THWIP_ACQUIRE_CONFIDENCE = 0.55
+THWIP_HOLD_CONFIDENCE = 0.25
+
 EXTENDED, AMBIGUOUS, FOLDED = 1, 0, -1
 
 
@@ -68,28 +81,87 @@ def palm_scale(lm) -> float:
     return _dist2(lm[WRIST], lm[MIDDLE_MCP])
 
 
-def finger_states(lm) -> dict[str, int]:
-    """EXTENDED / FOLDED / AMBIGUOUS per finger.
+def finger_straightness(lm) -> dict[str, float | None]:
+    """Continuous straightness ratio for each non-thumb finger.
 
     Uses the ratio of each finger's end-to-end distance to the length of its
     three-bone chain. This survives palm/back views, wrist rotation and finger
     splay. When available, callers should pass MediaPipe's metric world
     landmarks rather than image-normalised landmarks.
+
+    ``None`` means the landmark chain was degenerate. Keeping that distinct
+    from 0.0 prevents a tracking failure from looking like a confidently
+    folded finger.
     """
-    out = {}
+    out: dict[str, float | None] = {}
     for name, joints in FINGERS.items():
         chain = sum(_dist3(lm[a], lm[b]) for a, b in zip(joints, joints[1:]))
         if chain < 1e-6:
+            out[name] = None
+            continue
+        out[name] = _dist3(lm[joints[0]], lm[joints[-1]]) / chain
+    return out
+
+
+def states_from_straightness(
+    straightness: dict[str, float | None],
+) -> dict[str, int]:
+    """Quantise continuous ratios for old callers and the debug harness."""
+    out = {}
+    for name in FINGERS:
+        value = straightness.get(name)
+        if value is None:
             out[name] = AMBIGUOUS
             continue
-        straightness = _dist3(lm[joints[0]], lm[joints[-1]]) / chain
-        if straightness >= EXTENDED_STRAIGHTNESS:
+        if value >= EXTENDED_STRAIGHTNESS:
             out[name] = EXTENDED
-        elif straightness <= FOLDED_STRAIGHTNESS:
+        elif value <= FOLDED_STRAIGHTNESS:
             out[name] = FOLDED
         else:
             out[name] = AMBIGUOUS
     return out
+
+
+def finger_states(lm) -> dict[str, int]:
+    """EXTENDED / FOLDED / AMBIGUOUS per finger.
+
+    Compatibility wrapper around :func:`finger_straightness`. New gesture
+    decisions should retain the continuous values instead of quantising them.
+    """
+    return states_from_straightness(finger_straightness(lm))
+
+
+def _ramp(value: float | None, low: float, high: float) -> float:
+    if value is None or not math.isfinite(value) or high <= low:
+        return 0.0
+    return min(1.0, max(0.0, (value - low) / (high - low)))
+
+
+def extension_confidence(value: float | None) -> float:
+    """0..1 confidence that a finger is extended."""
+    return _ramp(value, EXTENSION_CONFIDENCE_LOW, EXTENSION_CONFIDENCE_HIGH)
+
+
+def fold_confidence(value: float | None) -> float:
+    """0..1 confidence that a finger is folded."""
+    if value is None or not math.isfinite(value):
+        return 0.0
+    return 1.0 - _ramp(value, FOLD_CONFIDENCE_LOW, FOLD_CONFIDENCE_HIGH)
+
+
+def thwip_confidence(straightness: dict[str, float | None]) -> float:
+    """Continuous confidence for index+pinky out, middle+ring folded.
+
+    The weakest required finger controls the result. This is intentionally
+    conservative: three correct fingers must not hide an open ring finger or a
+    lost pinky landmark.
+    """
+    return min(
+        extension_confidence(straightness.get("index")),
+        extension_confidence(straightness.get("pinky")),
+        fold_confidence(straightness.get("middle")),
+        fold_confidence(straightness.get("ring")),
+    )
 
 
 def is_thwip(states: dict[str, int]) -> bool:
@@ -154,6 +226,87 @@ class PoseLatch:
     @property
     def state(self) -> bool:
         return self._state
+
+
+class ThwipLatch:
+    """Confidence-aware latch with stricter acquisition than maintenance.
+
+    Ambiguous curled fingertips are useful evidence while maintaining a web,
+    because those fingertips are often occluded by the palm. They are not
+    enough to *start* a web: acquisition requires every required finger to
+    clear the higher confidence threshold for a short, time-based interval.
+    """
+
+    def __init__(
+        self,
+        on_s: float = 0.06,
+        off_s: float = 0.16,
+        acquire_confidence: float = THWIP_ACQUIRE_CONFIDENCE,
+        hold_confidence: float = THWIP_HOLD_CONFIDENCE,
+    ) -> None:
+        if not 0.0 <= hold_confidence <= acquire_confidence <= 1.0:
+            raise ValueError("expected 0 <= hold confidence <= acquire confidence <= 1")
+        self.acquire_confidence = acquire_confidence
+        self.hold_confidence = hold_confidence
+        self._latch = PoseLatch(on_s=on_s, off_s=off_s)
+        self.raw = False
+
+    def update(self, confidence: float, now: float) -> bool:
+        threshold = (
+            self.hold_confidence if self._latch.state else self.acquire_confidence
+        )
+        self.raw = confidence >= threshold
+        return self._latch.update(self.raw, now)
+
+    @property
+    def state(self) -> bool:
+        return self._latch.state
+
+    @property
+    def threshold(self) -> float:
+        return self.hold_confidence if self.state else self.acquire_confidence
+
+
+class AimSmoother:
+    """Time-based EMA for the palm centre used to choose an anchor.
+
+    Time-based alpha keeps the feel consistent across fast and slow cameras.
+    After a longer tracking gap the new position is accepted immediately so a
+    stale palm location cannot drag the next shot across the screen.
+    """
+
+    def __init__(
+        self,
+        time_constant_s: float = 0.08,
+        reset_gap_s: float = 0.35,
+    ) -> None:
+        if time_constant_s <= 0.0:
+            raise ValueError("time_constant_s must be positive")
+        self.time_constant_s = time_constant_s
+        self.reset_gap_s = reset_gap_s
+        self._value: tuple[float, float] | None = None
+        self._last_time: float | None = None
+
+    def update(self, x: float, y: float, now: float) -> tuple[float, float]:
+        sample = (x, y)
+        if self._value is None or self._last_time is None:
+            self._value = sample
+        else:
+            dt = now - self._last_time
+            if dt <= 0.0 or dt >= self.reset_gap_s:
+                self._value = sample
+            else:
+                alpha = 1.0 - math.exp(-dt / self.time_constant_s)
+                self._value = tuple(
+                    old + alpha * (new - old)
+                    for old, new in zip(self._value, sample)
+                )
+        self._last_time = now
+        return self._value
+
+    @property
+    def value(self) -> tuple[float, float] | None:
+        return self._value
 
 
 @dataclass

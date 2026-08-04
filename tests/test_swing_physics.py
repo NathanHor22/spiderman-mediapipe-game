@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 from spidergame.control import ControlState
 from spidergame.game import tuning as T
-from spidergame.game.swing import Anchor, SwingSim
-from spidergame.render.world import WorldStrip
+from spidergame.game.swing import Anchor, SwingEvent, SwingSim
+from spidergame.render.world import Building, WorldStrip
 
 
 HOLD = ControlState(thwip_held=True, tracking_lost=False)
@@ -87,6 +87,17 @@ class SwingPhysicsTests(unittest.TestCase):
         self.assertAlmostEqual(sim.y, 33.0, delta=0.03)
         self.assertGreater(sim.vy, 0.0)
 
+    def test_reeling_stops_at_the_per_shot_target(self):
+        self.tuning.enter_context(patch.object(T, "REEL_RATE", 12.0))
+        sim = self.attached_sim((0.0, 30.0, 0.0), (0.0, 0.0, 0.0), 20.0)
+        sim.anchor.reel_target = 14.0
+
+        for _ in range(240):
+            sim.update(1.0 / 120.0, HOLD, self.world)
+
+        self.assertAlmostEqual(sim.anchor.rest_length, 14.0, delta=1.0e-4)
+        self.assertAlmostEqual(sim.y, 36.0, delta=0.03)
+
     def test_inward_motion_makes_an_unpowered_web_slack(self):
         self.tuning.enter_context(patch.object(T, "GRAVITY", 0.0))
         sim = self.attached_sim((10.0, 50.0, 0.0), (-5.0, 0.0, 0.0), 10.0)
@@ -122,6 +133,28 @@ class SwingPhysicsTests(unittest.TestCase):
 
         self.assertGreaterEqual(sim.vy - before, T.WEB_CATCH_UP_SPEED - 1e-6)
 
+    def test_anchor_search_skips_a_low_roof_for_a_taller_neighbour(self):
+        world = WorldStrip(seed=1)
+        world.buildings = [
+            Building(-30.0, -14.0, 0.0, 30.0, 72.0, -1),
+            Building(-30.0, -14.0, 32.0, 62.0, 132.0, -1),
+        ]
+        sim = SwingSim()
+        sim.y = 80.0
+        aim_left = ControlState(
+            thwip_held=True,
+            hand_x=0.1,
+            hand_y=0.5,
+            tracking_lost=False,
+        )
+
+        anchor = sim._pick_anchor(world, aim_left)
+
+        self.assertIsNotNone(anchor)
+        self.assertEqual(anchor.z, 32.0)
+        self.assertGreater(anchor.y, sim.y)
+        self.assertEqual(sum(sim.whiff_reason.values()), 0)
+
     def test_passing_anchor_does_not_auto_detach(self):
         self.tuning.enter_context(patch.object(T, "GRAVITY", 0.0))
         sim = self.attached_sim((0.0, 50.0, 10.0), (0.0, 0.0, 5.0), 10.0)
@@ -129,6 +162,56 @@ class SwingPhysicsTests(unittest.TestCase):
         sim.update(1.0 / 60.0, HOLD, self.world)
 
         self.assertTrue(sim.attached)
+
+    def test_swept_arc_cap_releases_once_and_requires_a_new_pose(self):
+        self.tuning.enter_context(patch.object(T, "GRAVITY", 0.0))
+        self.tuning.enter_context(patch.object(T, "MAX_SWING_ARC_DEG", 20.0))
+        sim = self.attached_sim(
+            (10.0, 50.0, 0.0),
+            (0.0, 0.0, 20.0),
+            10.0,
+        )
+
+        seen = []
+        for _ in range(60):
+            seen.extend(sim.update(1.0 / 120.0, HOLD, self.world))
+            if not sim.attached:
+                break
+
+        self.assertFalse(sim.attached)
+        self.assertEqual(seen.count(SwingEvent.RELEASE), 1)
+        self.assertEqual(sim.release_reason, "arc limit")
+        self.assertEqual(sim.auto_releases, 1)
+
+        # Keeping the same pose cannot immediately fire and attach again.
+        self.assertEqual(sim.update(1.0 / 60.0, HOLD, self.world), ())
+        self.assertFalse(sim.attached)
+
+    def test_web_events_are_edge_triggered(self):
+        sim = SwingSim()
+        with patch.object(sim, "_pick_anchor", return_value=None):
+            first = sim.update(1.0 / 60.0, HOLD, self.world)
+            second = sim.update(1.0 / 60.0, HOLD, self.world)
+
+        self.assertEqual(first, (SwingEvent.SHOT, SwingEvent.MISS))
+        self.assertEqual(second, ())
+
+    def test_manual_release_preserves_velocity_and_emits_once(self):
+        sim = self.attached_sim(
+            (0.0, 30.0, 0.0),
+            (3.0, 4.0, 5.0),
+            20.0,
+        )
+        before = (sim.vx, sim.vy, sim.vz)
+        release = ControlState(thwip_held=False, tracking_lost=False)
+
+        events = sim.update(1.0e-9, release, self.world)
+
+        self.assertEqual(events, (SwingEvent.RELEASE,))
+        self.assertAlmostEqual(sim.vx, before[0], places=6)
+        self.assertAlmostEqual(sim.vy, before[1], places=6)
+        self.assertAlmostEqual(sim.vz, before[2], places=6)
+        self.assertEqual(sim.update(1.0e-9, release, self.world), ())
 
 
 if __name__ == "__main__":

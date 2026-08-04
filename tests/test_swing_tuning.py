@@ -1,8 +1,9 @@
+import math
 import unittest
 
 from spidergame.control import ControlState
 from spidergame.game import tuning as T
-from spidergame.game.swing import SwingSim
+from spidergame.game.swing import SwingEvent, SwingSim
 from spidergame.render.world import WorldStrip
 
 
@@ -52,6 +53,60 @@ class SwingHeightTests(unittest.TestCase):
         self.assertTrue(sim.rope_taut)
         self.assertGreater(sim.y, T.START_Y + 2.0)
         self.assertGreater(sim.angular_speed, 0.0)
+
+    def test_default_swing_releases_before_orbit_with_upward_momentum(self):
+        sim = SwingSim()
+        world = WorldStrip(seed=11)
+        hold = ControlState(
+            thwip_held=True,
+            hand_x=0.35,
+            hand_y=0.5,
+            tracking_lost=False,
+        )
+        releases = 0
+
+        for _ in range(240):
+            world.update(sim.z + 60.0)
+            events = sim.update(1.0 / 120.0, hold, world)
+            releases += events.count(SwingEvent.RELEASE)
+            if not sim.attached and sim.attaches:
+                break
+
+        self.assertEqual(releases, 1)
+        self.assertEqual(sim.auto_releases, 1)
+        self.assertEqual(sim.release_reason, "rise limit")
+        self.assertGreater(sim.y, T.START_Y + 10.0)
+        self.assertGreater(sim.vy, 0.0)
+        self.assertLess(sim.web_arc, math.tau)
+
+        # The held sign is still the same shot; release/re-form is required.
+        self.assertEqual(sim.update(1.0 / 60.0, hold, world), ())
+        self.assertEqual(sim.attaches, 1)
+
+    def test_high_anchor_uses_swept_angle_before_momentum_reverses(self):
+        sim = SwingSim()
+        world = WorldStrip(seed=5)
+        high_reaching_hold = ControlState(
+            thwip_held=True,
+            hand_x=0.1,
+            hand_y=0.15,
+            tracking_lost=False,
+        )
+
+        for _ in range(360):
+            world.update(sim.z + 60.0)
+            events = sim.update(1.0 / 240.0, high_reaching_hold, world)
+            if SwingEvent.RELEASE in events:
+                break
+
+        self.assertEqual(sim.release_reason, "rise limit")
+        self.assertGreaterEqual(
+            math.degrees(sim.web_arc),
+            T.AUTO_RELEASE_SWEEP_DEG,
+        )
+        self.assertGreater(sim.y, T.START_Y + 10.0)
+        self.assertGreater(sim.vy, 0.0)
+        self.assertGreater(sim.vz, 0.0)
 
 
 if __name__ == "__main__":

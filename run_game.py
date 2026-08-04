@@ -24,6 +24,7 @@ import sys
 
 import pygame
 
+from spidergame.audio import SoundSystem, prepare_mixer
 from spidergame.clock import GameClock
 from spidergame.control import ControlState
 from spidergame.game import tuning as T
@@ -42,7 +43,7 @@ COUNTDOWN_STEPS = ("3", "2", "1", "GO")
 COUNTDOWN_STEP_S = 0.55
 
 
-def open_vision(index: int, font, screen):
+def open_vision(index: int, font, screen, timeout: float = 45.0):
     """Start the vision thread, drawing a status frame first since it blocks."""
     from spidergame.producers import VisionProducer
 
@@ -54,11 +55,26 @@ def open_vision(index: int, font, screen):
     pygame.event.pump()
 
     producer = VisionProducer(camera_index=index, keep_frame=True)
-    if not producer.wait_ready(45.0):
+    if not producer.wait_ready(timeout):
         err = producer.error or "timed out"
         producer.close()
         return None, err
     return producer, None
+
+
+def _try_camera_switch(current, current_index: int, new_index: int, opener):
+    """Replace a live camera only after its candidate is confirmed ready."""
+    candidate, error = opener(new_index)
+    if candidate is None:
+        return (
+            current,
+            current_index,
+            f"camera {new_index}: {error}",
+            False,
+        )
+
+    current.close()
+    return candidate, new_index, None, True
 
 
 def main() -> int:
@@ -83,6 +99,7 @@ def main() -> int:
             print(f"  {name}")
         return 0
 
+    prepare_mixer()
     pygame.init()
     pygame.display.set_caption("spider — endless swinger")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -91,9 +108,9 @@ def main() -> int:
     big = pygame.font.SysFont("consolas", 46, bold=True)
     fonts = (font, mid, big)
     clock_src = pygame.time.Clock()
+    audio = SoundSystem()
 
     camera_index = args.camera if args.camera is not None else 0
-    camera_names: list[str] = []
     producer = None
     vision_error = None
     auto_picked = False
@@ -111,15 +128,16 @@ def main() -> int:
             if found is None:
                 print("no camera delivering usable frames — check the privacy "
                       "shutter and Windows camera permissions", file=sys.stderr)
+                audio.close()
                 pygame.quit()
                 return 1
             camera_index = found
             auto_picked = True
 
-        camera_names = devices.system_names()
         producer, vision_error = open_vision(camera_index, font, screen)
         if producer is None:
             print(f"vision failed: {vision_error}", file=sys.stderr)
+            audio.close()
             pygame.quit()
             return 1
     else:
@@ -137,10 +155,11 @@ def main() -> int:
     sim = SwingSim()
     cam = Camera3D(x=0.0, y=sim.y + T.CAMERA_UP, z=sim.z - T.CAMERA_BACK)
 
-    state = TITLE
+    state = COUNTDOWN if args.skip_tutorial else TITLE
+    title_menu = screens.TitleMenu()
+    title_menu_rects: tuple[pygame.Rect, ...] = ()
     flow = None
     countdown_t = 0.0
-    tutorial_seen = args.skip_tutorial
     show_windows = True
     show_stats = False
     best_distance = 0.0
@@ -148,31 +167,45 @@ def main() -> int:
 
     def reset_run():
         nonlocal world, sim
+        audio.stop()
         world = WorldStrip(seed=args.seed)
         sim = SwingSim()
         cam.x, cam.y, cam.z = 0.0, sim.y + T.CAMERA_UP, sim.z - T.CAMERA_BACK
         cam.roll = 0.0
 
     def switch_camera(delta: int):
-        nonlocal producer, camera_index, vision_error
+        nonlocal producer, camera_index, vision_error, auto_picked
         if not args.vision:
             return
         new_index = max(0, camera_index + delta)
         if new_index == camera_index:
             return
-        producer.close()
-        candidate, err = open_vision(new_index, font, screen)
-        if candidate is None:
-            # Fall back to the one that worked rather than leaving the game
-            # with no input at all.
-            producer, _ = open_vision(camera_index, font, screen)
-            vision_error = f"camera {new_index}: {err}"
-        else:
-            producer = candidate
-            camera_index = new_index
-            vision_error = None
+        producer, camera_index, vision_error, switched = _try_camera_switch(
+            producer,
+            camera_index,
+            new_index,
+            lambda index: open_vision(index, font, screen, timeout=10.0),
+        )
+        if switched:
+            auto_picked = False
 
     running = True
+
+    def activate_title(action: str | None) -> bool:
+        """Apply one title action and report whether it consumed the input."""
+        nonlocal state, countdown_t, flow, running
+        if action == "start":
+            reset_run()
+            state, countdown_t = COUNTDOWN, 0.0
+        elif action == "training":
+            flow = screens.TutorialFlow(args.vision)
+            state = TUTORIAL
+        elif action == "quit":
+            running = False
+        else:
+            return False
+        return True
+
     while running:
         clock.tick(clock_src.tick(60) / 1000.0)
         rdt = clock.real_dt
@@ -181,23 +214,32 @@ def main() -> int:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEMOTION and state == TITLE:
+                title_menu.select_at(event.pos, title_menu_rects)
+            elif (
+                event.type == pygame.MOUSEBUTTONDOWN
+                and event.button == 1
+                and state == TITLE
+            ):
+                activate_title(
+                    title_menu.activate_at(event.pos, title_menu_rects)
+                )
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    if state in (PLAYING, DEAD, TUTORIAL):
+                title_action = (
+                    title_menu.handle_event(event) if state == TITLE else None
+                )
+                if activate_title(title_action):
+                    pass
+                elif event.key == pygame.K_ESCAPE:
+                    if state in (PLAYING, DEAD, TUTORIAL, COUNTDOWN):
+                        audio.stop()
                         state = TITLE
                     else:
                         running = False
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                    if state == TITLE:
-                        if tutorial_seen:
-                            reset_run()
-                            state, countdown_t = COUNTDOWN, 0.0
-                        else:
-                            flow = screens.TutorialFlow(args.vision)
-                            state = TUTORIAL
-                    elif state == DEAD:
+                    if state == DEAD:
                         state = TITLE
-                elif event.key == pygame.K_t and state in (TITLE, DEAD):
+                elif event.key == pygame.K_t and state == DEAD:
                     flow = screens.TutorialFlow(args.vision)
                     state = TUTORIAL
                 elif event.key == pygame.K_r and state in (PLAYING, DEAD):
@@ -214,6 +256,11 @@ def main() -> int:
             if isinstance(producer, KeyboardProducer):
                 producer.handle_event(event)
 
+        # Do not poll input, advance physics, or start a last sound after the
+        # window or title menu has already requested shutdown.
+        if not running:
+            break
+
         ctrl = producer.poll()
 
         keys = pygame.key.get_pressed()
@@ -228,6 +275,19 @@ def main() -> int:
             if frame is not None:
                 cam_surface = bgr_to_surface(frame)
 
+        # Commit flow transitions before choosing which world to render. This
+        # prevents a countdown expiry from drawing gameplay HUD over the menu
+        # backdrop, and makes tutorial completion show "3" immediately.
+        if state == TUTORIAL:
+            flow.update(ctrl, rdt)
+            if flow.done:
+                reset_run()
+                state, countdown_t = COUNTDOWN, 0.0
+        elif state == COUNTDOWN:
+            countdown_t += rdt
+            if int(countdown_t / COUNTDOWN_STEP_S) >= len(COUNTDOWN_STEPS):
+                state = PLAYING
+
         # ---------------------------------------------------------- update
         if state in (TITLE, TUTORIAL, COUNTDOWN):
             backdrop_cam.z += 46.0 * rdt
@@ -240,9 +300,11 @@ def main() -> int:
             dt = clock.game_dt
             if state == PLAYING:
                 world.update(sim.z + 60.0)
-                sim.update(dt, ctrl, world)
+                swing_events = sim.update(dt, ctrl, world)
+                audio.handle(swing_events, sim)
                 best_distance = max(best_distance, sim.z)
                 if not sim.alive:
+                    audio.stop()
                     state = DEAD
 
             lag = min(1.0, T.CAMERA_LAG * dt) if dt > 0 else 0.0
@@ -264,33 +326,31 @@ def main() -> int:
         pulse = math.sin(pulse_t * 3.0)
 
         if state == TITLE:
-            info = f"index {camera_index}" if args.vision else ""
+            info = "[ / ] switch camera" if args.vision else ""
             if auto_picked:
-                info += "  (auto-selected)"
+                info += "  |  auto-selected"
             if vision_error:
-                info += f"   ({vision_error})"
-            screens.draw_title(screen, fonts, vision=args.vision,
-                               camera_index=camera_index, camera_info=info,
-                               names=camera_names, pulse=pulse,
-                               cam_surface=cam_surface)
+                info = f"({vision_error})  |  [ / ] switch camera"
+            title_menu_rects = screens.draw_title(
+                screen,
+                fonts,
+                vision=args.vision,
+                camera_index=camera_index,
+                camera_info=info,
+                pulse=pulse,
+                cam_surface=cam_surface,
+                ctrl=ctrl,
+                selected=title_menu,
+                sound_available=audio.enabled,
+            )
 
         elif state == TUTORIAL:
-            flow.update(ctrl, rdt)
-            if flow.done:
-                tutorial_seen = True
-                reset_run()
-                state, countdown_t = COUNTDOWN, 0.0
-            else:
-                screens.draw_tutorial(screen, fonts, flow, ctrl, cam_surface,
-                                      pulse)
+            screens.draw_tutorial(screen, fonts, flow, ctrl, cam_surface,
+                                  pulse)
 
         elif state == COUNTDOWN:
-            countdown_t += rdt
             idx = int(countdown_t / COUNTDOWN_STEP_S)
-            if idx >= len(COUNTDOWN_STEPS):
-                state = PLAYING
-            else:
-                screens.draw_countdown(screen, fonts, COUNTDOWN_STEPS[idx])
+            screens.draw_countdown(screen, fonts, COUNTDOWN_STEPS[idx])
 
         if state in (PLAYING, DEAD):
             hud.draw_text(screen, big, f"{sim.z:6.0f} m", (24, 20), hud.INK)
@@ -337,10 +397,21 @@ def main() -> int:
 
         pygame.display.flip()
 
-    producer.close()
-    pygame.quit()
+    try:
+        producer.close()
+    finally:
+        try:
+            audio.close()
+        finally:
+            pygame.quit()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    finally:
+        # Idempotent, and still tears SDL down if an unexpected frame-loop
+        # exception bypasses main's normal producer/audio cleanup path.
+        pygame.quit()
+    raise SystemExit(exit_code)
