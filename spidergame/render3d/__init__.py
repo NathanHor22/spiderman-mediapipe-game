@@ -1,4 +1,4 @@
-"""Optional Panda3D presentation layer for the swing simulation.
+"""Primary Panda3D presentation layer for the swing simulation.
 
 The package stays import-light so asset tools can use
 ``spidergame.render3d.buildings`` without importing Pygame or Panda3D.  Game

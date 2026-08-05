@@ -114,13 +114,12 @@ class GameFlowIntegrationTests(unittest.TestCase):
 
     def run_main(self, event_feed, *arguments):
         with (
-            patch.object(sys, "argv", ["run_game.py", *arguments]),
             patch.object(run_game, "KeyboardProducer", FakeKeyboardProducer),
             patch.object(run_game, "SoundSystem", FakeAudio),
             patch.object(run_game, "prepare_mixer"),
             patch.object(pygame.event, "get", event_feed),
         ):
-            result = run_game.main()
+            result = run_game.legacy_main(arguments)
         return (
             result,
             FakeKeyboardProducer.instances[-1],
@@ -216,6 +215,44 @@ class GameFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(audio.handles, 0)
         self.assertEqual(producer.closed, 1)
         self.assertEqual(audio.closed, 1)
+
+
+class LauncherTests(unittest.TestCase):
+    def test_default_launcher_forwards_arguments_to_panda3d(self):
+        with patch(
+            "spidergame.render3d.game.main",
+            return_value=23,
+        ) as game_main:
+            result = run_game.main(["--headless", "--frames", "2"])
+
+        self.assertEqual(result, 23)
+        game_main.assert_called_once_with(["--headless", "--frames", "2"])
+
+    def test_default_launcher_uses_process_argv_when_not_supplied(self):
+        with (
+            patch.object(sys, "argv", ["run_game.py", "--no-audio"]),
+            patch("spidergame.render3d.game.main", return_value=0) as game_main,
+        ):
+            result = run_game.main()
+
+        self.assertEqual(result, 0)
+        game_main.assert_called_once_with(["--no-audio"])
+
+    def test_legacy_flag_is_removed_before_calling_pygame_runner(self):
+        with patch.object(run_game, "legacy_main", return_value=17) as legacy:
+            result = run_game.main(
+                ["--seed", "9", "--legacy-renderer", "--skip-tutorial"]
+            )
+
+        self.assertEqual(result, 17)
+        legacy.assert_called_once_with(["--seed", "9", "--skip-tutorial"])
+
+    def test_keyboard_flag_is_accepted_by_legacy_launcher(self):
+        with patch.object(run_game, "legacy_main", return_value=0) as legacy:
+            result = run_game.main(["--legacy-renderer", "--keyboard"])
+
+        self.assertEqual(result, 0)
+        legacy.assert_called_once_with([])
 
 
 if __name__ == "__main__":

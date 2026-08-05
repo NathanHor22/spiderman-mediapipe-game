@@ -28,14 +28,22 @@ pip install -r requirements.txt
 
 The hand landmarker model (~8MB) downloads automatically on first run.
 
-### Panda3D asset-backed path
+### Primary Panda3D game
 
-The third-person asset-backed renderer has a separate entry point:
+The third-person asset-backed renderer is now the default game:
 
 ```
-python run_game_3d.py
-python run_game_3d.py --vision --camera 0
+python run_game.py
+python run_game.py --camera 0
+python run_game.py --keyboard
 ```
+
+`python run_game_3d.py` remains available as a direct alias to the same game.
+MediaPipe camera gestures are the default control scheme. The game auto-selects
+a working camera and shows its live preview on the title, training, and Settings
+screens. Open SETTINGS from the main menu to choose and apply a different camera
+source. Use `--keyboard` when a camera is unavailable; `--vision` is retained as
+a compatibility flag for older launch commands.
 
 It uses the existing `SwingSim`, anchor selection, gesture producer and
 procedural sound system, but renders twelve instanced, textured New York
@@ -53,13 +61,17 @@ use the names above; an adjacent `character_manifest.json` can supply clip
 aliases, a physics pivot and exact hand-joint names. Pass
 `--character-manifest path/to/hero.json` to use a different manifest filename.
 If an asset is missing or incompatible, the runner reports the reason and uses
-the tall red-and-blue placeholder. The original Pygame runner remains available
-as a fallback.
+the tall red-and-blue placeholder. The original block-based Pygame renderer is
+kept as an explicit fallback:
+
+```
+python run_game.py --legacy-renderer
+```
 
 For a non-interactive smoke test:
 
 ```
-python run_game_3d.py --headless --frames 5 --skip-title --no-audio --no-character
+python run_game.py --headless --keyboard --frames 5 --skip-tutorial --no-audio --no-character
 ```
 
 The supplied building and character archives did not contain license or
@@ -68,23 +80,28 @@ confirm the original asset licenses before publishing or redistributing them.
 
 ## What runs today
 
-The original runner and diagnostic tools use Pygame; the asset-backed runner
-uses Panda3D. Neither path uses `cv2.imshow`, which has no sound, no real event
-handling and its own frame pacing. OpenCV is only used for camera capture and
-colour conversion.
+The primary asset-backed game uses Panda3D. Diagnostic tools and the optional
+`--legacy-renderer` fallback use Pygame. Neither path uses `cv2.imshow`, which
+has no sound, no real event handling and its own frame pacing. OpenCV is only
+used for camera capture and colour conversion.
 
-**`python run_game.py`** — the game. Keyboard by default; `--vision` swaps in the
-webcam and nothing else changes.
+**`python run_game.py`** — the 3D game with MediaPipe camera gestures enabled by
+default. Hold the web-shooter pose (index + pinky extended, middle + ring curled)
+to fire and keep a web attached, move your hand left or right to choose an
+anchor, and relax the pose to release. `--keyboard` provides the equivalent
+space/mouse controls without opening a camera.
 
 | key | |
 |---|---|
 | `↑` / `↓` or `W` / `S`, then `ENTER` | choose a title-screen action |
 | mouse hover + click | select and activate a title-screen action |
-| hold `SPACE` / left mouse | thwip |
-| mouse position | which side you anchor to, and how high |
-| `X` hold | preview spider-sense slow motion |
+| `T` | open training from the title or game-over screen |
+| web-shooter hand pose | thwip and keep the web attached |
+| hand position | choose which side you anchor to, and how high |
+| hold `SPACE` / left mouse | thwip in `--keyboard` mode |
+| mouse position | aim in `--keyboard` mode |
 | `R` | restart |
-| `TAB` / `F1` | windows / stats |
+| `ESC` | return to the title, or quit from the title/loading screen |
 
 **One web per thwip.** You must release before firing another, so choosing when
 to let go *is* the game. Without that gate, holding the sign down forever was the
@@ -93,14 +110,14 @@ web reels in by a small, fixed amount and pulls upward, then either releases whe
 you relax the pose or assists the release near the top of the rising arc. A swept-
 arc safety cap prevents unusual approaches from turning into endless loops.
 
-The comic-style starting screen has START, TRAINING and QUIT choices over a live
-corridor, plus an aspect-correct camera preview and live hand/gesture status in
-vision mode. START goes directly to the countdown; TRAINING opens the interactive
-lesson. The tutorial gates on you actually performing each action — hold the
-sign, let go, then sweep left and right — rather than on a timer. Losing hand
-tracking deliberately does not satisfy the "let go" step, or you could skip it
-by dropping your hand out of frame. `--skip-tutorial` bypasses the title as well
-and starts at the countdown.
+The starting screen has START, TRAINING, SETTINGS and QUIT choices over a live
+corridor, plus an aspect-correct camera preview and live hand/gesture status.
+START goes directly to the countdown; TRAINING opens the interactive lesson,
+using the supplied Spider-Man glove artwork as the pose reference. The tutorial
+gates on you actually performing each action — hold the sign, let go, then sweep
+left and right — rather than on a timer. Losing hand tracking deliberately does
+not satisfy the "let go" step, or you could skip it by dropping your hand out of
+frame. `--skip-tutorial` bypasses the title as well and starts at the countdown.
 
 Web shots, catches, misses and releases use procedural sound effects, so there
 are no external audio assets to install. While attached, a looping stereo whoosh
@@ -114,14 +131,17 @@ laptop's built-in camera can sit at index 0 returning black frames behind a
 privacy shutter — on this machine index 0 went from 30fps/bright to
 1fps/black between two runs for exactly that reason.
 
-So `--vision` **auto-picks the first index that delivers real pixels**, and `[`
-and `]` cycle cameras live on the title screen with a preview inset. Pick the one
-you can see yourself in.
+The default game **auto-picks the first index that delivers real pixels**. To
+change it, open SETTINGS, use the on-screen previous/next source buttons, inspect
+the live preview, and choose APPLY CAMERA. A failed source keeps the current
+working camera active. The `[` and `]` shortcuts remain available for developer
+testing, but are not required for normal use.
 
 ```
 python run_game.py --list-cameras     # probe indices + Windows device names
-python run_game.py --vision           # auto-pick
-python run_game.py --vision --camera 1
+python run_game.py                    # auto-pick a working camera
+python run_game.py --camera 1         # request a capture index
+python run_game.py --keyboard         # play without MediaPipe/a camera
 ```
 
 `--list-cameras` prints Windows device names for orientation and annotates a
@@ -200,7 +220,11 @@ spidergame/
   render3d/
     buildings.py        Panda3D GLB instancing over logical building proxies
     character.py        Actor clips, physics-driven states and wrist sockets
-    game.py             3D loop, camera, UI, road, web and input adapters
+    tutorial.py         input-independent tutorial and countdown flow
+    settings.py         camera-source selection and settings navigation
+    game.py             3D loop, aligned UI, camera, road, web and adapters
+  assets/ui/
+    spider-man-thwip.png  transparent tutorial pose reference
   ui/
     surface.py          camera frames -> pygame surfaces
     hud.py              text, meters, panels
@@ -222,7 +246,8 @@ full speed while the world crawls is the whole point.
 - [x] 1. Gesture harness — thwip + punch, with calibration
 - [x] 2. Corridor renderer
 - [x] 3. Swing physics, on the keyboard producer, with scaled dt from the start
-- [x] 4. Vision producer swap (`--vision`) — plumbed, not yet played with a hand
+- [x] 4. MediaPipe vision producer — default controls with live preview,
+      training and camera switching (`--keyboard` is the fallback)
 - [ ] 5. Static obstacles, collision, fall-to-street death
 - [ ] 6. Goblin + bomb QTE on the time-scale system
 - [ ] 7. Scoring, speed ramp, juice

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -29,10 +30,24 @@ from spidergame.game import tuning as T
 from spidergame.game.swing import SwingSim
 from spidergame.producers.keyboard import KeyboardProducer
 from spidergame.render.world import STREET_HALF, WorldStrip
+from spidergame.render3d.settings import (
+    SettingsIntent,
+    SettingsMenu,
+    SettingsRow,
+)
+from spidergame.render3d.tutorial import (
+    Countdown,
+    MenuIntent,
+    TitleMenu,
+    TutorialController,
+    TutorialStep,
+)
 
 
 _PANDA_IMPORT_ERROR: ModuleNotFoundError | None = None
 try:
+    from direct.gui.DirectGui import DGG, DirectButton, DirectFrame, DirectWaitBar
+    from direct.gui.OnscreenImage import OnscreenImage
     from direct.gui.OnscreenText import OnscreenText
     from direct.showbase.ShowBase import ShowBase
     from panda3d.core import (
@@ -45,6 +60,8 @@ try:
         LineSegs,
         MouseButton,
         TextNode,
+        Texture,
+        TransparencyAttrib,
         Vec3,
         loadPrcFileData,
     )
@@ -70,6 +87,7 @@ DEFAULT_CHARACTER_ASSET = (
 DEFAULT_CHARACTER_MANIFEST = (
     PROJECT_ROOT / "assets" / "models" / "character" / "character_manifest.json"
 )
+DEFAULT_THWIP_IMAGE = PROJECT_ROOT / "assets" / "ui" / "spider-man-thwip.png"
 
 PLAYER_HEIGHT = 4.8
 CAMERA_BACK = 18.0
@@ -78,6 +96,10 @@ CAMERA_LOOK_AHEAD = 7.0
 CAMERA_RESPONSE = 7.5
 ROAD_LENGTH = 1_200.0
 MAX_FRAME_DT = 0.05
+LOADING_MIN_SECONDS = 0.65
+VISION_STARTUP_TIMEOUT = 45.0
+VISION_SWITCH_TIMEOUT = 10.0
+CAMERA_SOURCE_COUNT = 4
 
 
 class GameStartupError(RuntimeError):
@@ -87,7 +109,11 @@ class GameStartupError(RuntimeError):
 class GameState(Enum):
     """Small state machine shared by keyboard callbacks and the frame task."""
 
+    LOADING = auto()
     TITLE = auto()
+    TUTORIAL = auto()
+    SETTINGS = auto()
+    COUNTDOWN = auto()
     PLAYING = auto()
     DEAD = auto()
 
@@ -102,8 +128,8 @@ class GameConfig:
     character_asset: Path | None = DEFAULT_CHARACTER_ASSET
     character_manifest: Path | None = None
     audio: bool = True
-    vision: bool = False
-    camera_index: int = 0
+    vision: bool = True
+    camera_index: int | None = None
     skip_title: bool = False
     headless: bool = False
     max_frames: int | None = None
@@ -135,6 +161,25 @@ def _resolved_path(value: str | Path) -> Path:
     return path.resolve()
 
 
+def _short_camera_message(value: object, limit: int = 82) -> str:
+    """Keep driver diagnostics inside the fixed-width camera card."""
+
+    message = " ".join(str(value).split())
+    if len(message) <= limit:
+        return message
+    return message[: max(1, limit - 3)].rstrip() + "..."
+
+
+def _camera_switch_allowed(state: GameState, vision: bool) -> bool:
+    """Camera controls are useful anywhere the live preview is visible."""
+
+    return bool(vision) and state in {
+        GameState.TITLE,
+        GameState.TUTORIAL,
+        GameState.SETTINGS,
+    }
+
+
 def validate_building_assets(asset_path: Path, manifest_path: Path) -> None:
     """Fail before opening a window when required city data is incomplete."""
 
@@ -158,7 +203,7 @@ def require_panda3d() -> None:
 
     if _PANDA_IMPORT_ERROR is not None:
         raise GameStartupError(
-            "Panda3D is required for run_game_3d.py. Install it with "
+            "Panda3D is required for the 3D game. Install it with "
             "`python -m pip install panda3d`, then run this entry point again."
         ) from _PANDA_IMPORT_ERROR
 
@@ -274,38 +319,131 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
         self._frames = 0
         self._title_distance = 0.0
         self._camera_ready = False
+        self._loading_elapsed = 0.0
+        self._vision_deadline = 0.0
+        self._vision_ready = not config.vision
+        self._camera_has_frame = False
+        self._camera_frame_token: int | None = None
+        self._camera_texture_size: tuple[int, int] | None = None
+        self.camera_index = config.camera_index
+        self.auto_picked_camera = False
+        self.vision_error: str | None = None
+        self.camera_notice: str | None = None
+        self._camera_notice_until = 0.0
+        self.control = ControlState(tracking_lost=config.vision)
         self.best_distance = 0.0
+        self.title_menu = TitleMenu()
+        self.tutorial = TutorialController(vision=config.vision)
+        self.countdown = Countdown()
+        self.settings_menu: SettingsMenu | None = None
+        self.settings_message = ""
+        self.producer: Any | None = None
 
+        self._setup_boot_ui()
+        self._render_boot_stage("PREPARING THE CITY", 8.0)
         self._setup_lighting_and_fog()
         self._setup_road()
         self.player = self.render.attachNewNode("player-root")
         self._setup_character_lighting()
         self.character_controller = None
+        self._render_boot_stage("LOADING THE ANIMATED HERO", 28.0)
         self.character_note = self._load_character(
             config.character_asset,
             config.character_manifest,
         )
         self._web_node = None
 
+        self._render_boot_stage("ASSEMBLING NEW YORK", 48.0)
         self.building_renderer = self._create_building_renderer()
-        self.producer = self._create_producer()
+        self._render_boot_stage("PREPARING SWING SOUND", 66.0)
         self.audio = self._create_audio()
-        self._setup_ui()
-        self._bind_controls()
 
         self.world = WorldStrip(seed=config.seed)
+        self.backdrop_world = WorldStrip(seed=config.seed + 7)
         self.sim = SwingSim()
         self.world.update(self.sim.z + 60.0)
-        self._sync_buildings()
+        self.backdrop_world.update(60.0)
+        self._sync_buildings(self.backdrop_world)
 
-        self.state = GameState.TITLE
-        self._set_state(
-            GameState.PLAYING if config.skip_title else GameState.TITLE,
-            reset=config.skip_title,
-        )
+        self.state = GameState.LOADING
+        self._clear_boot_ui()
+        self._setup_ui()
+        self._set_state(GameState.LOADING)
+        self._render_loading_stage("CITY AND HERO READY", 72.0)
+        self.producer = self._create_producer()
+        self.settings_menu = self._create_settings_menu()
+        self._bind_controls()
         self.taskMgr.add(self._update, "spidergame-3d-update", sort=10)
 
     # --------------------------------------------------------------- startup
+
+    def _setup_boot_ui(self) -> None:
+        """Create a minimal overlay before any model or audio work begins."""
+
+        common = dict(parent=self.aspect2d, mayChange=True)
+        self._boot_nodes = [
+            DirectFrame(
+                parent=self.aspect2d,
+                frameSize=(-1.78, 1.78, -1.0, 1.0),
+                frameColor=(0.015, 0.020, 0.050, 1.0),
+            ),
+            OnscreenText(
+                text="SPIDER SWING",
+                pos=(0.0, 0.26),
+                scale=0.14,
+                align=TextNode.ACenter,
+                fg=(0.94, 0.96, 1.0, 1.0),
+                shadow=(0.02, 0.02, 0.05, 0.95),
+                **common,
+            ),
+        ]
+        self._boot_text = OnscreenText(
+            text="STARTING",
+            pos=(0.0, -0.02),
+            scale=0.052,
+            align=TextNode.ACenter,
+            fg=(0.72, 0.80, 0.94, 1.0),
+            **common,
+        )
+        self._boot_bar = DirectWaitBar(
+            parent=self.aspect2d,
+            pos=(0.0, 0.0, -0.20),
+            frameSize=(-0.52, 0.52, -0.025, 0.025),
+            frameColor=(0.05, 0.07, 0.13, 1.0),
+            barColor=(0.80, 0.08, 0.12, 1.0),
+            relief=DGG.FLAT,
+            range=100,
+            value=0,
+            text="",
+        )
+        self._boot_hint = OnscreenText(
+            text="Loading real buildings, character and animation...",
+            pos=(0.0, -0.31),
+            scale=0.035,
+            align=TextNode.ACenter,
+            fg=(0.48, 0.56, 0.70, 1.0),
+            **common,
+        )
+        self._boot_nodes.extend(
+            (self._boot_text, self._boot_bar, self._boot_hint)
+        )
+
+    def _render_boot_stage(self, message: str, progress: float) -> None:
+        self._boot_text.setText(message)
+        self._boot_bar["value"] = max(0.0, min(100.0, float(progress)))
+        try:
+            self.graphicsEngine.renderFrame()
+        except Exception:
+            pass
+
+    def _clear_boot_ui(self) -> None:
+        for node in self._boot_nodes:
+            destroy = getattr(node, "destroy", None)
+            if callable(destroy):
+                destroy()
+            else:
+                node.removeNode()
+        self._boot_nodes = []
 
     def _create_building_renderer(self) -> Any:
         try:
@@ -342,24 +480,62 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
 
     def _create_producer(self) -> Any:
         if not self.game_config.vision:
+            self._vision_ready = True
+            self._render_loading_stage("KEYBOARD AND MOUSE READY", 88.0)
             return PandaKeyboardProducer(self)
 
         from spidergame.producers.vision import VisionProducer
 
-        producer = VisionProducer(
-            camera_index=self.game_config.camera_index,
-            keep_frame=False,
-        )
-        if producer.wait_ready(timeout=15.0):
-            return producer
+        index = self.game_config.camera_index
+        if index is None:
+            self._render_loading_stage("LOOKING FOR A WORKING CAMERA", 78.0)
+            from spidergame.vision import devices
 
-        error = producer.error or "camera did not deliver usable frames"
-        producer.close()
-        raise GameStartupError(
-            f"could not start vision camera {self.game_config.camera_index}: "
-            f"{error}. Choose another device with --camera N or run without "
-            "--vision for keyboard controls."
+            index = devices.pick_default()
+            if index is None:
+                index = 0
+                self.vision_error = (
+                    "no camera delivered usable pixels; check the privacy "
+                    "shutter and Windows camera permissions"
+                )
+            else:
+                self.auto_picked_camera = True
+                self.camera_notice = f"camera {index} auto-selected"
+                self._camera_notice_until = time.monotonic() + 4.0
+        self.camera_index = index
+        self._render_loading_stage(
+            f"CONNECTING TO CAMERA {index}\nFIRST RUN MAY DOWNLOAD THE HAND MODEL",
+            86.0,
         )
+        producer = VisionProducer(
+            camera_index=index,
+            keep_frame=True,
+        )
+        self._vision_ready = False
+        self._vision_deadline = time.monotonic() + VISION_STARTUP_TIMEOUT
+        return producer
+
+    def _create_settings_menu(self) -> SettingsMenu:
+        """Build predictable capture-index choices without reopening devices."""
+
+        if not self.game_config.vision:
+            return SettingsMenu([])
+        active = 0 if self.camera_index is None else int(self.camera_index)
+        upper = max(CAMERA_SOURCE_COUNT - 1, active)
+        return SettingsMenu(range(upper + 1), active_camera=active)
+
+    def _render_loading_stage(self, message: str, progress: float) -> None:
+        """Publish a startup stage before a potentially blocking probe."""
+
+        if not hasattr(self, "loading_text"):
+            return
+        self.loading_text.setText(message)
+        self.loading_bar["value"] = max(0.0, min(100.0, float(progress)))
+        try:
+            self.graphicsEngine.renderFrame()
+        except Exception:
+            # An offscreen smoke test may not have a complete output yet.
+            pass
 
     def _setup_lighting_and_fog(self) -> None:
         ambient = AmbientLight("ambient")
@@ -465,41 +641,438 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
 
     def _setup_ui(self) -> None:
         common = dict(parent=self.aspect2d, mayChange=True)
-        self.title_text = OnscreenText(
-            text="SPIDER\nENDLESS SWINGER",
-            pos=(0.0, 0.34),
-            scale=0.13,
+        menu_x = -0.68 if self.game_config.vision else 0.0
+        camera_x = 0.78
+        tutorial_x = -0.68 if self.game_config.vision else 0.0
+        settings_x = -0.68 if self.game_config.vision else 0.0
+        self.loading_panel = DirectFrame(
+            parent=self.aspect2d,
+            frameSize=(-1.78, 1.78, -1.0, 1.0),
+            frameColor=(0.015, 0.020, 0.050, 0.92),
+        )
+        self.loading_title = OnscreenText(
+            text="SPIDER SWING",
+            pos=(0.0, 0.26),
+            scale=0.14,
             align=TextNode.ACenter,
-            fg=(0.95, 0.96, 1.0, 1.0),
+            fg=(0.94, 0.96, 1.0, 1.0),
+            shadow=(0.02, 0.02, 0.05, 0.95),
+            **common,
+        )
+        self.loading_text = OnscreenText(
+            text="LOADING CITY",
+            pos=(0.0, -0.02),
+            scale=0.052,
+            align=TextNode.ACenter,
+            fg=(0.72, 0.80, 0.94, 1.0),
+            **common,
+        )
+        self.loading_bar = DirectWaitBar(
+            parent=self.aspect2d,
+            pos=(0.0, 0.0, -0.20),
+            frameSize=(-0.52, 0.52, -0.025, 0.025),
+            frameColor=(0.05, 0.07, 0.13, 1.0),
+            barColor=(0.80, 0.08, 0.12, 1.0),
+            relief=DGG.FLAT,
+            range=100,
+            value=8,
+            text="",
+        )
+        self.loading_hint = OnscreenText(
+            text="Preparing the animated city and gesture controls...",
+            pos=(0.0, -0.31),
+            scale=0.035,
+            align=TextNode.ACenter,
+            fg=(0.48, 0.56, 0.70, 1.0),
+            **common,
+        )
+
+        self.title_panel = DirectFrame(
+            parent=self.aspect2d,
+            pos=(menu_x, 0.0, 0.0),
+            frameSize=(-0.66, 0.66, -0.79, 0.79),
+            frameColor=(0.018, 0.024, 0.060, 0.92),
+        )
+        self.title_text = OnscreenText(
+            text="SPIDER SWING",
+            pos=(menu_x, 0.67),
+            scale=0.105,
+            align=TextNode.ACenter,
+            fg=(0.96, 0.12, 0.15, 1.0),
             shadow=(0.02, 0.02, 0.04, 0.9),
             **common,
         )
+        self.title_subtitle = OnscreenText(
+            text="ENDLESS CITY SWINGER  //  THIRD PERSON",
+            pos=(menu_x, 0.53),
+            scale=0.032,
+            align=TextNode.ACenter,
+            fg=(0.55, 0.67, 0.95, 1.0),
+            **common,
+        )
+        self.title_buttons: list[Any] = []
+        for index, label in enumerate(self.title_menu.labels):
+            button = DirectButton(
+                parent=self.aspect2d,
+                text=label,
+                pos=(menu_x, 0.0, 0.29 - index * 0.13),
+                scale=0.050,
+                frameSize=(-9.4, 9.4, -0.82, 0.82),
+                frameColor=(0.05, 0.07, 0.14, 0.96),
+                text_fg=(0.82, 0.87, 0.98, 1.0),
+                text_shadow=(0.01, 0.01, 0.02, 0.9),
+                relief=DGG.FLAT,
+                rolloverSound=None,
+                clickSound=None,
+                command=self._activate_title_button,
+                extraArgs=[index],
+            )
+            button.bind(DGG.ENTER, self._hover_title_button, [index])
+            self.title_buttons.append(button)
         control_help = (
-            "Show the web-shooter sign to fire\n"
-            "Move your hand to aim  |  relax it to launch"
+            "AIM       Move your hand left or right\n"
+            "THWIP     Index + pinky out; curl middle + ring\n"
+            "RELEASE   Relax the sign near the top of the arc"
             if self.game_config.vision
             else (
-                "Hold SPACE / mouse 1 to shoot a web\n"
-                "Aim with the mouse  |  release to launch"
+                "AIM       Move the mouse left or right\n"
+                "THWIP     Hold SPACE or left mouse\n"
+                "RELEASE   Let go near the top of the arc"
             )
         )
         self.title_help = OnscreenText(
-            text=f"ENTER  START\n{control_help}\nESC  QUIT",
-            pos=(0.0, -0.20),
-            scale=0.052,
-            align=TextNode.ACenter,
+            text=control_help,
+            pos=(menu_x - 0.54, -0.31),
+            scale=0.030,
+            align=TextNode.ALeft,
             fg=(0.78, 0.84, 0.95, 1.0),
             shadow=(0.02, 0.02, 0.04, 0.9),
+            wordwrap=36,
             **common,
         )
+        self.title_nav_hint = OnscreenText(
+            text="UP / DOWN  SELECT     ENTER  CONFIRM",
+            pos=(menu_x, -0.57),
+            scale=0.027,
+            align=TextNode.ACenter,
+            fg=(0.48, 0.57, 0.74, 1.0),
+            **common,
+        )
+        hero_status = (
+            "ANIMATED HERO"
+            if self.character_controller is not None
+            else "PLACEHOLDER HERO"
+        )
         self.asset_text = OnscreenText(
-            text=self.character_note,
-            pos=(-1.30, -0.91),
-            scale=0.035,
-            align=TextNode.ALeft,
+            text=(
+                f"{hero_status}  //  "
+                f"AUDIO {'READY' if self.audio.enabled else 'OFF'}"
+            ),
+            pos=(menu_x, -0.71),
+            scale=0.024,
+            align=TextNode.ACenter,
             fg=(0.58, 0.64, 0.74, 1.0),
             **common,
         )
+
+        self.camera_border = DirectFrame(
+            parent=self.aspect2d,
+            pos=(camera_x, 0.0, 0.02),
+            frameSize=(-0.62, 0.62, -0.62, 0.66),
+            frameColor=(0.018, 0.026, 0.062, 0.96),
+            relief=DGG.FLAT,
+        )
+        self._camera_texture = Texture("live-camera-preview")
+        self._camera_texture.setup2dTexture(
+            2,
+            2,
+            Texture.T_unsigned_byte,
+            Texture.F_rgb8,
+        )
+        self._camera_texture.setRamImage(bytes((12, 16, 30) * 4))
+        self.camera_image = OnscreenImage(
+            parent=self.aspect2d,
+            image=self._camera_texture,
+            pos=(camera_x, 0.0, 0.12),
+            scale=(0.54, 1.0, 0.35),
+        )
+        self.camera_header = OnscreenText(
+            text="LIVE CAMERA",
+            pos=(camera_x, 0.57),
+            scale=0.037,
+            align=TextNode.ACenter,
+            fg=(0.82, 0.88, 1.0, 1.0),
+            **common,
+        )
+        self.camera_status = OnscreenText(
+            text="CAMERA STARTING",
+            pos=(camera_x, -0.31),
+            scale=0.034,
+            align=TextNode.ACenter,
+            fg=(1.0, 0.72, 0.20, 1.0),
+            **common,
+        )
+        self.camera_help = OnscreenText(
+            text="Open SETTINGS to choose a camera source",
+            pos=(camera_x, -0.43),
+            scale=0.026,
+            align=TextNode.ACenter,
+            fg=(0.50, 0.58, 0.72, 1.0),
+            wordwrap=43,
+            **common,
+        )
+
+        self.tutorial_panel = DirectFrame(
+            parent=self.aspect2d,
+            pos=(tutorial_x, 0.0, 0.0),
+            frameSize=(-0.72, 0.72, -0.74, 0.74),
+            frameColor=(0.015, 0.022, 0.058, 0.94),
+        )
+        self.tutorial_counter = OnscreenText(
+            text="TUTORIAL 1 / 3",
+            pos=(tutorial_x - 0.61, 0.65),
+            scale=0.029,
+            align=TextNode.ALeft,
+            fg=(0.54, 0.64, 0.83, 1.0),
+            **common,
+        )
+        self.tutorial_title = OnscreenText(
+            text="MAKE THE WEB-SHOOTER SIGN",
+            pos=(tutorial_x, 0.53),
+            scale=0.050,
+            align=TextNode.ACenter,
+            fg=(0.96, 0.97, 1.0, 1.0),
+            shadow=(0.02, 0.02, 0.05, 0.9),
+            **common,
+        )
+        self.tutorial_hint = OnscreenText(
+            text="",
+            pos=(tutorial_x, 0.40),
+            scale=0.029,
+            align=TextNode.ACenter,
+            fg=(0.62, 0.70, 0.86, 1.0),
+            wordwrap=42,
+            **common,
+        )
+        self.tutorial_status = OnscreenText(
+            text="MAKE THE SIGN",
+            pos=(tutorial_x, -0.24),
+            scale=0.039,
+            align=TextNode.ACenter,
+            fg=(1.0, 0.72, 0.20, 1.0),
+            **common,
+        )
+        self.tutorial_prompt = OnscreenText(
+            text="hold it...",
+            pos=(tutorial_x, -0.31),
+            scale=0.028,
+            align=TextNode.ACenter,
+            fg=(0.48, 0.56, 0.70, 1.0),
+            **common,
+        )
+        self.tutorial_progress = DirectWaitBar(
+            parent=self.aspect2d,
+            pos=(tutorial_x, 0.0, -0.43),
+            frameSize=(-0.51, 0.51, -0.019, 0.019),
+            frameColor=(0.05, 0.07, 0.13, 1.0),
+            barColor=(0.12, 0.82, 0.48, 1.0),
+            relief=DGG.FLAT,
+            range=100,
+            value=0,
+            text="",
+        )
+        self.tutorial_escape = OnscreenText(
+            text="ESC  BACK TO TITLE",
+            pos=(tutorial_x, -0.62),
+            scale=0.026,
+            align=TextNode.ACenter,
+            fg=(0.48, 0.56, 0.70, 1.0),
+            **common,
+        )
+        self.thwip_reference = self._build_thwip_reference(tutorial_x)
+
+        self.settings_panel = DirectFrame(
+            parent=self.aspect2d,
+            pos=(settings_x, 0.0, 0.0),
+            frameSize=(-0.72, 0.72, -0.74, 0.74),
+            frameColor=(0.015, 0.022, 0.058, 0.95),
+        )
+        self.settings_title = OnscreenText(
+            text="SETTINGS",
+            pos=(settings_x, 0.64),
+            scale=0.075,
+            align=TextNode.ACenter,
+            fg=(0.96, 0.97, 1.0, 1.0),
+            shadow=(0.02, 0.02, 0.05, 0.9),
+            **common,
+        )
+        self.settings_subtitle = OnscreenText(
+            text="CAMERA AND INPUT",
+            pos=(settings_x, 0.52),
+            scale=0.030,
+            align=TextNode.ACenter,
+            fg=(0.55, 0.67, 0.95, 1.0),
+            **common,
+        )
+        self.settings_source_heading = OnscreenText(
+            text="CAMERA SOURCE",
+            pos=(settings_x, 0.37),
+            scale=0.031,
+            align=TextNode.ACenter,
+            fg=(0.64, 0.72, 0.88, 1.0),
+            **common,
+        )
+        self.settings_source_frame = DirectFrame(
+            parent=self.aspect2d,
+            pos=(settings_x, 0.0, 0.16),
+            frameSize=(-0.49, 0.49, -0.13, 0.13),
+            frameColor=(0.045, 0.060, 0.125, 0.98),
+            relief=DGG.FLAT,
+        )
+        self.settings_source_value = OnscreenText(
+            text="CAMERA 0",
+            pos=(settings_x, 0.19),
+            scale=0.043,
+            align=TextNode.ACenter,
+            fg=(0.94, 0.96, 1.0, 1.0),
+            **common,
+        )
+        self.settings_source_position = OnscreenText(
+            text="1 OF 4",
+            pos=(settings_x, 0.10),
+            scale=0.024,
+            align=TextNode.ACenter,
+            fg=(0.48, 0.58, 0.76, 1.0),
+            **common,
+        )
+        self.settings_prev_button = DirectButton(
+            parent=self.aspect2d,
+            text="<",
+            pos=(settings_x - 0.59, 0.0, 0.16),
+            frameSize=(-0.085, 0.085, -0.13, 0.13),
+            frameColor=(0.08, 0.11, 0.22, 0.98),
+            text_fg=(0.96, 0.97, 1.0, 1.0),
+            text_scale=0.052,
+            text_pos=(0.0, -0.018),
+            relief=DGG.FLAT,
+            rolloverSound=None,
+            clickSound=None,
+            command=self._cycle_settings_camera,
+            extraArgs=[-1],
+        )
+        self.settings_next_button = DirectButton(
+            parent=self.aspect2d,
+            text=">",
+            pos=(settings_x + 0.59, 0.0, 0.16),
+            frameSize=(-0.085, 0.085, -0.13, 0.13),
+            frameColor=(0.08, 0.11, 0.22, 0.98),
+            text_fg=(0.96, 0.97, 1.0, 1.0),
+            text_scale=0.052,
+            text_pos=(0.0, -0.018),
+            relief=DGG.FLAT,
+            rolloverSound=None,
+            clickSound=None,
+            command=self._cycle_settings_camera,
+            extraArgs=[1],
+        )
+        self.settings_source_hint = OnscreenText(
+            text="Choose a source, then apply it to the live preview.",
+            pos=(settings_x, -0.01),
+            scale=0.027,
+            align=TextNode.ACenter,
+            fg=(0.55, 0.64, 0.80, 1.0),
+            wordwrap=42,
+            **common,
+        )
+        self.settings_apply_button = DirectButton(
+            parent=self.aspect2d,
+            text="APPLY CAMERA",
+            pos=(settings_x, 0.0, -0.20),
+            frameSize=(-0.52, 0.52, -0.058, 0.058),
+            frameColor=(0.72, 0.04, 0.08, 0.98),
+            text_fg=(1.0, 1.0, 1.0, 1.0),
+            text_scale=0.040,
+            text_pos=(0.0, -0.014),
+            relief=DGG.FLAT,
+            rolloverSound=None,
+            clickSound=None,
+            command=self._activate_settings_apply,
+        )
+        self.settings_back_button = DirectButton(
+            parent=self.aspect2d,
+            text="BACK TO MENU",
+            pos=(settings_x, 0.0, -0.35),
+            frameSize=(-0.52, 0.52, -0.058, 0.058),
+            frameColor=(0.05, 0.07, 0.14, 0.98),
+            text_fg=(0.76, 0.82, 0.94, 1.0),
+            text_scale=0.040,
+            text_pos=(0.0, -0.014),
+            relief=DGG.FLAT,
+            rolloverSound=None,
+            clickSound=None,
+            command=self._activate_settings_back,
+        )
+        self.settings_status = OnscreenText(
+            text="",
+            pos=(settings_x, -0.50),
+            scale=0.028,
+            align=TextNode.ACenter,
+            fg=(0.55, 0.68, 0.90, 1.0),
+            wordwrap=42,
+            **common,
+        )
+        self.settings_footer = OnscreenText(
+            text="ARROWS / WASD  NAVIGATE   //   ENTER  SELECT   //   ESC  BACK",
+            pos=(settings_x, -0.65),
+            scale=0.023,
+            align=TextNode.ACenter,
+            fg=(0.42, 0.50, 0.66, 1.0),
+            **common,
+        )
+        self.settings_apply_button.bind(
+            DGG.ENTER,
+            self._hover_settings_row,
+            [SettingsRow.APPLY],
+        )
+        self.settings_back_button.bind(
+            DGG.ENTER,
+            self._hover_settings_row,
+            [SettingsRow.BACK],
+        )
+        self.settings_prev_button.bind(
+            DGG.ENTER,
+            self._hover_settings_row,
+            [SettingsRow.CAMERA],
+        )
+        self.settings_next_button.bind(
+            DGG.ENTER,
+            self._hover_settings_row,
+            [SettingsRow.CAMERA],
+        )
+
+        self.countdown_panel = DirectFrame(
+            parent=self.aspect2d,
+            frameSize=(-1.78, 1.78, -1.0, 1.0),
+            frameColor=(0.01, 0.015, 0.04, 0.56),
+        )
+        self.countdown_text = OnscreenText(
+            text="3",
+            pos=(0.0, 0.08),
+            scale=0.30,
+            align=TextNode.ACenter,
+            fg=(0.96, 0.97, 1.0, 1.0),
+            shadow=(0.80, 0.03, 0.06, 0.95),
+            **common,
+        )
+        self.countdown_status = OnscreenText(
+            text="GET READY",
+            pos=(0.0, -0.18),
+            scale=0.050,
+            align=TextNode.ACenter,
+            fg=(0.62, 0.72, 0.96, 1.0),
+            **common,
+        )
+
         self.hud_text = OnscreenText(
             text="",
             pos=(-1.30, 0.91),
@@ -519,10 +1092,135 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             **common,
         )
 
+        self._ui_nodes = [
+            self.loading_panel,
+            self.loading_title,
+            self.loading_text,
+            self.loading_bar,
+            self.loading_hint,
+            self.title_panel,
+            self.title_text,
+            self.title_subtitle,
+            *self.title_buttons,
+            self.title_help,
+            self.title_nav_hint,
+            self.asset_text,
+            self.camera_border,
+            self.camera_image,
+            self.camera_header,
+            self.camera_status,
+            self.camera_help,
+            self.tutorial_panel,
+            self.tutorial_counter,
+            self.tutorial_title,
+            self.tutorial_hint,
+            self.tutorial_status,
+            self.tutorial_prompt,
+            self.tutorial_progress,
+            self.tutorial_escape,
+            self.thwip_reference,
+            self.settings_panel,
+            self.settings_title,
+            self.settings_subtitle,
+            self.settings_source_heading,
+            self.settings_source_frame,
+            self.settings_source_value,
+            self.settings_source_position,
+            self.settings_prev_button,
+            self.settings_next_button,
+            self.settings_source_hint,
+            self.settings_apply_button,
+            self.settings_back_button,
+            self.settings_status,
+            self.settings_footer,
+            self.countdown_panel,
+            self.countdown_text,
+            self.countdown_status,
+            self.hud_text,
+            self.death_text,
+        ]
+        self._refresh_title_menu()
+
+    def _build_thwip_reference(self, centre_x: float) -> Any:
+        """Load the supplied transparent web-shooter reference artwork."""
+
+        if not DEFAULT_THWIP_IMAGE.is_file():
+            raise GameStartupError(
+                f"Tutorial reference image is missing: {DEFAULT_THWIP_IMAGE}"
+            )
+        try:
+            surface = pygame.image.load(str(DEFAULT_THWIP_IMAGE))
+            width, height = surface.get_size()
+            # Panda stores four-channel texture RAM in BGRA byte order on the
+            # supported desktop backends. Preserve the PNG alpha while keeping
+            # Spider-Man's red glove red rather than swapping it to blue.
+            bgra_bottom_up = pygame.image.tobytes(surface, "BGRA", True)
+        except (OSError, pygame.error) as exc:
+            raise GameStartupError(
+                f"Could not load tutorial reference image: {exc}"
+            ) from exc
+        texture = Texture("web-shooter-reference")
+        texture.setup2dTexture(
+            width,
+            height,
+            Texture.T_unsigned_byte,
+            Texture.F_rgba8,
+        )
+        texture.setRamImage(bgra_bottom_up)
+        image = OnscreenImage(
+            parent=self.aspect2d,
+            image=texture,
+            pos=(centre_x, 0.0, 0.10),
+            scale=(0.235, 1.0, 0.235),
+        )
+        image.setTransparency(TransparencyAttrib.MAlpha)
+        image.setDepthTest(False)
+        image.setDepthWrite(False)
+        return image
+
+    def _refresh_title_menu(self) -> None:
+        for index, button in enumerate(self.title_buttons):
+            selected = index == self.title_menu.selected
+            button["frameColor"] = (
+                (0.72, 0.04, 0.08, 0.98)
+                if selected
+                else (0.05, 0.07, 0.14, 0.96)
+            )
+            button["text_fg"] = (
+                (1.0, 1.0, 1.0, 1.0)
+                if selected
+                else (0.72, 0.79, 0.92, 1.0)
+            )
+
+    def _hover_title_button(self, index: int, *_event: Any) -> None:
+        if self.state is GameState.TITLE:
+            self.title_menu.selected = int(index) % len(self.title_menu.options)
+            self._refresh_title_menu()
+
+    def _activate_title_button(self, index: int) -> None:
+        if self.state is not GameState.TITLE:
+            return
+        self.title_menu.selected = int(index) % len(self.title_menu.options)
+        self._refresh_title_menu()
+        self._activate_title_intent(self.title_menu.activate())
+
     def _bind_controls(self) -> None:
         self.accept("enter", self._on_enter)
         self.accept("escape", self._on_escape)
         self.accept("r", self._on_restart)
+        self.accept("t", self._on_training)
+        self.accept("arrow_up", self._on_menu_key, ["arrow_up"])
+        self.accept("arrow_down", self._on_menu_key, ["arrow_down"])
+        self.accept("w", self._on_menu_key, ["w"])
+        self.accept("s", self._on_menu_key, ["s"])
+        self.accept("arrow_left", self._on_settings_key, ["arrow_left"])
+        self.accept("arrow_right", self._on_settings_key, ["arrow_right"])
+        self.accept("a", self._on_settings_key, ["a"])
+        self.accept("d", self._on_settings_key, ["d"])
+        self.accept("tab", self._on_settings_key, ["tab"])
+        self.accept("shift-tab", self._on_settings_key, ["shift_tab"])
+        self.accept("[", self._on_camera_shortcut, [-1])
+        self.accept("]", self._on_camera_shortcut, [1])
         latch_punch = getattr(self.producer, "latch_punch", None)
         if latch_punch is not None:
             self.accept("f", latch_punch)
@@ -534,22 +1232,111 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
         if reset:
             self._reset_run()
         self.state = state
+        loading = state is GameState.LOADING
         title = state is GameState.TITLE
+        tutorial = state is GameState.TUTORIAL
+        settings = state is GameState.SETTINGS
+        countdown = state is GameState.COUNTDOWN
         playing = state is GameState.PLAYING
         dead = state is GameState.DEAD
 
-        (self.title_text.show if title else self.title_text.hide)()
-        (self.title_help.show if title else self.title_help.hide)()
-        (self.asset_text.show if title else self.asset_text.hide)()
+        loading_nodes = (
+            self.loading_panel,
+            self.loading_title,
+            self.loading_text,
+            self.loading_bar,
+            self.loading_hint,
+        )
+        title_nodes = (
+            self.title_panel,
+            self.title_text,
+            self.title_subtitle,
+            *self.title_buttons,
+            self.title_help,
+            self.title_nav_hint,
+            self.asset_text,
+        )
+        camera_nodes = (
+            self.camera_border,
+            self.camera_image,
+            self.camera_header,
+            self.camera_status,
+            self.camera_help,
+        )
+        tutorial_nodes = (
+            self.tutorial_panel,
+            self.tutorial_counter,
+            self.tutorial_title,
+            self.tutorial_hint,
+            self.tutorial_status,
+            self.tutorial_prompt,
+            self.tutorial_progress,
+            self.tutorial_escape,
+        )
+        settings_nodes = (
+            self.settings_panel,
+            self.settings_title,
+            self.settings_subtitle,
+            self.settings_source_heading,
+            self.settings_source_frame,
+            self.settings_source_value,
+            self.settings_source_position,
+            self.settings_prev_button,
+            self.settings_next_button,
+            self.settings_source_hint,
+            self.settings_apply_button,
+            self.settings_back_button,
+            self.settings_status,
+            self.settings_footer,
+        )
+        countdown_nodes = (
+            self.countdown_panel,
+            self.countdown_text,
+            self.countdown_status,
+        )
+        for nodes, visible in (
+            (loading_nodes, loading),
+            (title_nodes, title),
+            (
+                camera_nodes,
+                self.game_config.vision and (title or tutorial or settings),
+            ),
+            (tutorial_nodes, tutorial),
+            (settings_nodes, settings),
+            (countdown_nodes, countdown),
+        ):
+            for node in nodes:
+                (node.show if visible else node.hide)()
+
+        show_reference = tutorial and self.tutorial.step is TutorialStep.HOLD
+        (
+            self.thwip_reference.show
+            if show_reference
+            else self.thwip_reference.hide
+        )()
         (self.hud_text.show if playing or dead else self.hud_text.hide)()
         (self.death_text.show if dead else self.death_text.hide)()
 
-        if title:
+        if loading or title or tutorial or settings or countdown:
             self.audio.stop()
             self._remove_web()
             if self.character_controller is not None:
                 self.character_controller.reset("idle")
             self._title_distance = max(self._title_distance, self.sim.z)
+            self._sync_buildings(self.backdrop_world)
+        if title:
+            self._refresh_title_menu()
+        elif tutorial:
+            self._refresh_tutorial_ui()
+        elif settings:
+            self._refresh_settings_ui()
+        elif countdown:
+            self.countdown.reset()
+            self.countdown_text.setText(self.countdown.text)
+            self.countdown_status.setText(self.countdown.status)
+        elif playing:
+            self._sync_buildings(self.world)
+            self._camera_ready = False
         elif dead:
             self.audio.stop()
             if self.character_controller is not None:
@@ -557,7 +1344,7 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             self.death_text.setText(
                 f"{self.sim.death_reason.upper()}\n"
                 f"{self.sim.z:.0f} m    BEST {self.best_distance:.0f} m\n\n"
-                "R  RESTART    ENTER / ESC  TITLE"
+                "R  RESTART    T  TRAINING    ENTER / ESC  TITLE"
             )
 
     def _reset_run(self) -> None:
@@ -565,7 +1352,7 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
         self.world = WorldStrip(seed=self.game_config.seed)
         self.sim = SwingSim()
         self.world.update(self.sim.z + 60.0)
-        self._sync_buildings()
+        self._sync_buildings(self.world)
         self._remove_web()
         self._camera_ready = False
         if self.character_controller is not None:
@@ -573,19 +1360,162 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
 
     def _on_enter(self) -> None:
         if self.state is GameState.TITLE:
-            self._set_state(GameState.PLAYING, reset=True)
+            self._activate_title_intent(self.title_menu.activate())
+        elif self.state is GameState.SETTINGS:
+            self._handle_settings_intent(
+                self._require_settings_menu().handle_key("enter")
+            )
         elif self.state is GameState.DEAD:
             self._set_state(GameState.TITLE)
 
     def _on_escape(self) -> None:
-        if self.state is GameState.TITLE:
+        if self.state in {GameState.LOADING, GameState.TITLE}:
             self.request_quit()
+        elif self.state is GameState.SETTINGS:
+            menu = self._require_settings_menu()
+            menu.discard()
+            self.settings_message = ""
+            self._set_state(GameState.TITLE)
         else:
             self._set_state(GameState.TITLE)
 
     def _on_restart(self) -> None:
         if self.state in {GameState.PLAYING, GameState.DEAD}:
             self._set_state(GameState.PLAYING, reset=True)
+
+    def _on_training(self) -> None:
+        if self.state is GameState.TITLE:
+            self.title_menu.select(MenuIntent.TRAINING)
+            self._refresh_title_menu()
+            self._activate_title_intent(MenuIntent.TRAINING)
+        elif self.state is GameState.DEAD:
+            self.tutorial.reset()
+            self._set_state(GameState.TUTORIAL)
+
+    def _on_menu_key(self, key: str) -> None:
+        if self.state is GameState.SETTINGS:
+            self._on_settings_key(key)
+            return
+        if self.state is not GameState.TITLE:
+            return
+        intent = self.title_menu.handle_key(key)
+        self._refresh_title_menu()
+        if intent is not None:
+            self._activate_title_intent(intent)
+
+    def _activate_title_intent(self, intent: MenuIntent) -> None:
+        if intent is MenuIntent.START:
+            self._begin_countdown(reset=True)
+        elif intent is MenuIntent.TRAINING:
+            self.tutorial.reset()
+            self._set_state(GameState.TUTORIAL)
+        elif intent is MenuIntent.SETTINGS:
+            self._require_settings_menu().discard()
+            self.settings_message = ""
+            self._set_state(GameState.SETTINGS)
+        elif intent is MenuIntent.QUIT:
+            self.request_quit()
+
+    def _require_settings_menu(self) -> SettingsMenu:
+        if self.settings_menu is None:
+            raise GameStartupError("Settings were opened before input initialisation")
+        return self.settings_menu
+
+    def _on_settings_key(self, key: str) -> None:
+        if self.state is not GameState.SETTINGS:
+            return
+        intent = self._require_settings_menu().handle_key(key)
+        self._refresh_settings_ui()
+        self._handle_settings_intent(intent)
+
+    def _on_camera_shortcut(self, delta: int) -> None:
+        if self.state is GameState.SETTINGS:
+            self._cycle_settings_camera(delta)
+        else:
+            self._switch_camera(delta)
+
+    def _hover_settings_row(
+        self,
+        row: SettingsRow,
+        *_event: Any,
+    ) -> None:
+        if self.state is GameState.SETTINGS:
+            self._require_settings_menu().select_row(row)
+            self._refresh_settings_ui()
+
+    def _cycle_settings_camera(self, delta: int) -> None:
+        if self.state is not GameState.SETTINGS:
+            return
+        menu = self._require_settings_menu()
+        menu.select_row(SettingsRow.CAMERA)
+        menu.cycle_camera(delta)
+        self.settings_message = (
+            "Selection changed. Choose APPLY CAMERA to test this source."
+            if menu.dirty
+            else "This is the active camera source."
+        )
+        self._refresh_settings_ui()
+
+    def _activate_settings_apply(self) -> None:
+        if self.state is not GameState.SETTINGS:
+            return
+        self._require_settings_menu().select_row(SettingsRow.APPLY)
+        self._refresh_settings_ui()
+        self._handle_settings_intent(SettingsIntent.APPLY)
+
+    def _activate_settings_back(self) -> None:
+        if self.state is not GameState.SETTINGS:
+            return
+        self._require_settings_menu().select_row(SettingsRow.BACK)
+        self._refresh_settings_ui()
+        self._handle_settings_intent(SettingsIntent.BACK)
+
+    def _handle_settings_intent(
+        self,
+        intent: SettingsIntent | None,
+    ) -> None:
+        if intent is None:
+            return
+        menu = self._require_settings_menu()
+        if intent is SettingsIntent.BACK:
+            menu.discard()
+            self.settings_message = ""
+            self._set_state(GameState.TITLE)
+            return
+
+        target = menu.pending_camera
+        if not self.game_config.vision or target is None:
+            self.settings_message = (
+                "Camera input is disabled. Restart without --keyboard to use "
+                "MediaPipe gestures."
+            )
+            self._refresh_settings_ui()
+            return
+        if target == self.camera_index:
+            menu.commit()
+            self.settings_message = f"Camera {target} is already active."
+            self._refresh_settings_ui()
+            return
+
+        self.settings_message = f"Testing camera {target}..."
+        self._refresh_settings_ui()
+        try:
+            self.graphicsEngine.renderFrame()
+        except Exception:
+            pass
+        if self._switch_camera_to(target):
+            menu.commit()
+            self.settings_message = f"Camera {target} is now active."
+        else:
+            self.settings_message = (
+                self.camera_notice or f"Camera {target} could not be opened."
+            )
+        self._refresh_settings_ui()
+
+    def _begin_countdown(self, *, reset: bool) -> None:
+        if reset:
+            self._reset_run()
+        self._set_state(GameState.COUNTDOWN)
 
     # --------------------------------------------------------------- frame
 
@@ -594,10 +1524,21 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             return task.done
 
         dt = min(max(float(self.clock.getDt()), 0.0), MAX_FRAME_DT)
-        if self.state is GameState.TITLE:
+        self._poll_control()
+        self._update_vision_health()
+
+        if self.state is GameState.LOADING:
+            self._update_loading(dt)
+        elif self.state is GameState.TITLE:
             self._update_title(dt)
+        elif self.state is GameState.TUTORIAL:
+            self._update_tutorial(dt)
+        elif self.state is GameState.SETTINGS:
+            self._update_settings(dt)
+        elif self.state is GameState.COUNTDOWN:
+            self._update_countdown(dt)
         elif self.state is GameState.PLAYING:
-            self._update_playing(dt)
+            self._update_playing(dt, self.control)
         else:
             self._update_player_node()
             self._update_camera(dt)
@@ -612,33 +1553,373 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             return task.done
         return task.cont
 
+    def _poll_control(self) -> None:
+        if self.producer is None:
+            return
+        try:
+            self.control = self.producer.poll()
+        except Exception as exc:
+            if self.game_config.vision:
+                self.vision_error = f"camera input failed: {exc}"
+
+    def _update_vision_health(self) -> None:
+        if not self.game_config.vision or self.producer is None:
+            return
+        error = getattr(self.producer, "error", None)
+        if error:
+            self.vision_error = str(error)
+            self._vision_ready = False
+            return
+        try:
+            ready = bool(self.producer.wait_ready(0.0))
+        except Exception as exc:
+            self.vision_error = f"camera startup failed: {exc}"
+            self._vision_ready = False
+            return
+        if ready:
+            newly_ready = not self._vision_ready
+            self._vision_ready = True
+            if newly_ready:
+                self.vision_error = None
+
+    def _update_loading(self, dt: float) -> None:
+        self._loading_elapsed += dt
+        self._update_menu_backdrop(dt)
+
+        terminal = self._vision_ready
+        if self.game_config.vision:
+            error = getattr(self.producer, "error", None)
+            timed_out = time.monotonic() >= self._vision_deadline
+            if error:
+                self.vision_error = str(error)
+            elif timed_out and not self._vision_ready:
+                self.vision_error = (
+                    f"camera {self.camera_index} timed out; open SETTINGS on "
+                    "the title screen to try another source"
+                )
+            terminal = self._vision_ready or bool(self.vision_error)
+            message = (
+                f"CAMERA {self.camera_index} READY"
+                if self._vision_ready
+                else (
+                    "CAMERA NEEDS ATTENTION"
+                    if self.vision_error
+                    else f"CONNECTING TO CAMERA {self.camera_index}"
+                )
+            )
+            self.loading_text.setText(message)
+        else:
+            sound = "SOUND READY" if self.audio.enabled else "SILENT MODE"
+            self.loading_text.setText(f"CITY, HERO AND CONTROLS READY  //  {sound}")
+
+        settling = min(1.0, self._loading_elapsed / LOADING_MIN_SECONDS)
+        self.loading_bar["value"] = 88.0 + settling * 12.0
+        if terminal and self._loading_elapsed >= LOADING_MIN_SECONDS:
+            if self.game_config.skip_title and (
+                not self.game_config.vision or self._vision_ready
+            ):
+                self._begin_countdown(reset=True)
+            else:
+                self._set_state(GameState.TITLE)
+
     def _update_title(self, dt: float) -> None:
-        self._title_distance += 20.0 * dt
-        self.world.update(self._title_distance + 60.0)
-        self._sync_buildings()
-        # Keep the hero clear of the centered title/instructions while still
-        # showing the third-person silhouette against the moving city.
+        self._update_menu_backdrop(dt)
+        self._update_camera_preview()
+
+    def _update_tutorial(self, dt: float) -> None:
+        self._update_menu_backdrop(dt)
+        self._update_camera_preview()
+        if self.tutorial.update(self.control, dt):
+            self._begin_countdown(reset=True)
+            return
+        self._refresh_tutorial_ui()
+
+    def _update_settings(self, dt: float) -> None:
+        self._update_menu_backdrop(dt)
+        self._update_camera_preview()
+        self._refresh_settings_ui()
+
+    def _update_countdown(self, dt: float) -> None:
+        self._update_menu_backdrop(dt)
+        if self.countdown.update(dt):
+            self._set_state(GameState.PLAYING)
+            self._update_player_node()
+            self._update_camera(0.0)
+            self._update_hud()
+            self.road.setY(self.sim.z)
+            return
+        self.countdown_text.setText(self.countdown.text)
+        self.countdown_status.setText(self.countdown.status)
+
+    def _update_menu_backdrop(self, dt: float) -> None:
+        self._title_distance += 32.0 * dt
+        self.backdrop_world.update(self._title_distance + 60.0)
+        self._sync_buildings(self.backdrop_world)
+        lateral = math.sin(self._title_distance * 0.018) * 2.4
         self.player.setPos(
-            *simulation_to_render(-5.5, T.START_Y, self._title_distance)
+            *simulation_to_render(-5.5, T.START_Y, self._title_distance + 8.0)
         )
         self.player.setHpr(0.0, 0.0, 0.0)
         self.road.setY(self._title_distance)
 
-        desired = Vec3(7.5, self._title_distance - 18.0, T.START_Y + 7.5)
-        focus = Vec3(0.0, self._title_distance + 6.0, T.START_Y + 0.4)
+        desired = Vec3(7.5 + lateral, self._title_distance - 18.0, T.START_Y + 7.5)
+        focus = Vec3(0.0, self._title_distance + 7.0, T.START_Y + 0.4)
         self.camera.setPos(desired)
         self.camera.lookAt(focus)
+        self.camLens.setFov(76.0)
         self._camera_ready = False
 
-    def _update_playing(self, dt: float) -> None:
-        control = self.producer.poll()
+    def _refresh_tutorial_ui(self) -> None:
+        view = self.tutorial.view
+        self.tutorial_counter.setText(
+            f"TUTORIAL {view.step_number} / {view.step_count}"
+        )
+        self.tutorial_title.setText(view.title)
+        self.tutorial_hint.setText(view.hint)
+        self.tutorial_status.setText(view.status)
+        self.tutorial_prompt.setText(view.prompt)
+        self.tutorial_progress["value"] = view.progress * 100.0
+
+        if "NO HAND" in view.status or "KEEP YOUR HAND" in view.status:
+            colour = (1.0, 0.25, 0.24, 1.0)
+        elif any(
+            marker in view.status
+            for marker in ("DETECTED", "COMPLETE", "TRACKING", "RANGE")
+        ):
+            colour = (0.18, 0.92, 0.56, 1.0)
+        else:
+            colour = (1.0, 0.72, 0.20, 1.0)
+        self.tutorial_status.setFg(colour)
+
+        show_reference = (
+            self.state is GameState.TUTORIAL
+            and view.step is TutorialStep.HOLD
+        )
+        (
+            self.thwip_reference.show
+            if show_reference
+            else self.thwip_reference.hide
+        )()
+
+    def _refresh_settings_ui(self) -> None:
+        menu = self._require_settings_menu()
+        view = menu.view
+        self.settings_source_heading.setText(view.camera_heading)
+        self.settings_source_value.setText(view.camera_value)
+        self.settings_source_position.setText(view.camera_position)
+        self.settings_source_hint.setText(view.camera_hint)
+
+        camera_focused = view.focused_row is SettingsRow.CAMERA
+        apply_focused = view.focused_row is SettingsRow.APPLY
+        back_focused = view.focused_row is SettingsRow.BACK
+        self.settings_source_frame["frameColor"] = (
+            (0.30, 0.045, 0.075, 0.98)
+            if camera_focused
+            else (0.045, 0.060, 0.125, 0.98)
+        )
+        for button in (self.settings_prev_button, self.settings_next_button):
+            button["frameColor"] = (
+                (0.72, 0.04, 0.08, 0.98)
+                if camera_focused
+                else (0.08, 0.11, 0.22, 0.98)
+            )
+            button["state"] = (
+                DGG.NORMAL if view.can_change_camera else DGG.DISABLED
+            )
+        self.settings_apply_button["frameColor"] = (
+            (0.72, 0.04, 0.08, 0.98)
+            if apply_focused
+            else (
+                (0.38, 0.045, 0.075, 0.98)
+                if view.dirty
+                else (0.05, 0.07, 0.14, 0.98)
+            )
+        )
+        self.settings_back_button["frameColor"] = (
+            (0.72, 0.04, 0.08, 0.98)
+            if back_focused
+            else (0.05, 0.07, 0.14, 0.98)
+        )
+
+        if self.settings_message:
+            message = _short_camera_message(self.settings_message, limit=92)
+        elif self.game_config.vision:
+            message = (
+                f"ACTIVE: CAMERA {self.camera_index}  //  "
+                "Preview changes only after Apply."
+            )
+        else:
+            message = (
+                "CAMERA INPUT DISABLED  //  Launch without --keyboard to "
+                "enable MediaPipe."
+            )
+        self.settings_status.setText(message)
+        if any(word in message.lower() for word in ("unavailable", "failed", "disabled")):
+            colour = (1.0, 0.30, 0.28, 1.0)
+        elif "now active" in message.lower() or "already active" in message.lower():
+            colour = (0.18, 0.92, 0.56, 1.0)
+        else:
+            colour = (0.58, 0.70, 0.92, 1.0)
+        self.settings_status.setFg(colour)
+
+    def _update_camera_preview(self) -> None:
+        if not self.game_config.vision or self.producer is None:
+            return
+        if (
+            self.camera_notice
+            and time.monotonic() >= self._camera_notice_until
+        ):
+            self.camera_notice = None
+
+        frame = None
+        worker = getattr(self.producer, "worker", None)
+        debug_frame = getattr(worker, "debug_frame", None)
+        if callable(debug_frame):
+            try:
+                frame, _landmarks = debug_frame()
+            except Exception as exc:
+                self.vision_error = f"camera preview failed: {exc}"
+
+        if frame is not None and id(frame) != self._camera_frame_token:
+            try:
+                height, width = frame.shape[:2]
+                if len(frame.shape) != 3 or frame.shape[2] < 3:
+                    raise ValueError("expected a three-channel BGR frame")
+                # VisionWorker has already mirrored the frame. Panda textures
+                # use a bottom-left origin, so reverse rows while changing BGR
+                # to RGB for an upright, natural preview.
+                rgb_bottom_up = frame[::-1, :, 2::-1].tobytes()
+                texture_size = (int(width), int(height))
+                if texture_size != self._camera_texture_size:
+                    self._camera_texture.setup2dTexture(
+                        *texture_size,
+                        Texture.T_unsigned_byte,
+                        Texture.F_rgb8,
+                    )
+                    self._camera_texture_size = texture_size
+                    source_aspect = width / max(1.0, float(height))
+                    box_aspect = 0.54 / 0.35
+                    if source_aspect >= box_aspect:
+                        image_x = 0.54
+                        image_z = image_x / source_aspect
+                    else:
+                        image_z = 0.35
+                        image_x = image_z * source_aspect
+                    self.camera_image.setScale(image_x, 1.0, image_z)
+                self._camera_texture.setRamImage(rgb_bottom_up)
+                self._camera_frame_token = id(frame)
+                self._camera_has_frame = True
+                if self.vision_error and self.vision_error.startswith(
+                    "camera preview failed"
+                ):
+                    self.vision_error = None
+            except Exception as exc:
+                self.vision_error = f"camera preview failed: {exc}"
+
+        auto = "  //  AUTO" if self.auto_picked_camera else ""
+        self.camera_header.setText(f"LIVE CAMERA {self.camera_index}{auto}")
+        if self.vision_error:
+            status = "CAMERA NEEDS ATTENTION"
+            colour = (1.0, 0.25, 0.24, 1.0)
+            help_text = _short_camera_message(
+                f"{self.vision_error}  |  Open SETTINGS to choose another source"
+            )
+        elif not self._camera_has_frame:
+            status = "CAMERA STARTING"
+            colour = (1.0, 0.72, 0.20, 1.0)
+            help_text = "Keep your full hand in frame"
+        elif self.control.tracking_lost:
+            status = "NO HAND - MOVE INTO FRAME"
+            colour = (1.0, 0.25, 0.24, 1.0)
+            help_text = "Show your full palm and fingertips to the camera"
+        elif self.control.thwip_held:
+            status = "WEB-SHOOTER DETECTED"
+            colour = (0.18, 0.92, 0.56, 1.0)
+            help_text = "Gesture locked - release to detach the web"
+        else:
+            status = "HAND FOUND - MAKE THE SIGN"
+            colour = (1.0, 0.72, 0.20, 1.0)
+            help_text = "Index + pinky out; curl middle + ring"
+        if self.camera_notice and not self.vision_error:
+            help_text = _short_camera_message(self.camera_notice)
+        if not self.vision_error and "SETTINGS" not in help_text.upper():
+            help_text = _short_camera_message(
+                f"{help_text}  |  Open SETTINGS to change camera"
+            )
+        self.camera_status.setText(status)
+        self.camera_status.setFg(colour)
+        self.camera_help.setText(help_text)
+
+    def _switch_camera(self, delta: int) -> None:
+        if not _camera_switch_allowed(self.state, self.game_config.vision):
+            return
+        current_index = 0 if self.camera_index is None else self.camera_index
+        new_index = max(0, current_index + int(delta))
+        if new_index == current_index:
+            return
+        self._switch_camera_to(new_index)
+
+    def _switch_camera_to(self, new_index: int) -> bool:
+        if not _camera_switch_allowed(self.state, self.game_config.vision):
+            return False
+        current_index = 0 if self.camera_index is None else self.camera_index
+        new_index = max(0, int(new_index))
+        if new_index == current_index:
+            return True
+
+        self.camera_status.setText(f"CONNECTING TO CAMERA {new_index}")
+        self.camera_status.setFg((1.0, 0.72, 0.20, 1.0))
+        self.camera_help.setText("Testing the camera before switching...")
+        try:
+            self.graphicsEngine.renderFrame()
+        except Exception:
+            pass
+
+        from spidergame.producers.vision import VisionProducer
+
+        candidate = None
+        try:
+            candidate = VisionProducer(camera_index=new_index, keep_frame=True)
+            if not candidate.wait_ready(VISION_SWITCH_TIMEOUT) or candidate.error:
+                raise RuntimeError(candidate.error or "timed out")
+        except Exception as exc:
+            if candidate is not None:
+                candidate.close()
+            self.camera_notice = _short_camera_message(
+                f"camera {new_index} unavailable ({exc}); "
+                f"still using camera {current_index}"
+            )
+            self._camera_notice_until = time.monotonic() + 6.0
+            self._update_camera_preview()
+            return False
+
+        old = self.producer
+        self.producer = candidate
+        self.camera_index = new_index
+        self.auto_picked_camera = False
+        self.vision_error = None
+        self.camera_notice = f"Camera {new_index} ready."
+        self._camera_notice_until = time.monotonic() + 4.0
+        self._vision_ready = True
+        self._camera_has_frame = False
+        self._camera_frame_token = None
+        self._camera_texture_size = None
+        self.control = ControlState(tracking_lost=True)
+        if old is not None:
+            old.close()
+        if self.state is not GameState.SETTINGS:
+            self.settings_menu = self._create_settings_menu()
+        self._update_camera_preview()
+        return True
+
+    def _update_playing(self, dt: float, control: ControlState) -> None:
         self.world.update(self.sim.z + 60.0)
         events = self.sim.update(dt, control, self.world)
         self.audio.handle(events, self.sim)
         if self.character_controller is not None:
             self.character_controller.update(self.sim, events, dt)
         self.best_distance = max(self.best_distance, self.sim.z)
-        self._sync_buildings()
+        self._sync_buildings(self.world)
         self._update_player_node()
         self._update_web()
         self._update_camera(dt)
@@ -648,9 +1929,9 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
         if not self.sim.alive:
             self._set_state(GameState.DEAD)
 
-    def _sync_buildings(self) -> None:
+    def _sync_buildings(self, world: WorldStrip | None = None) -> None:
         try:
-            self.building_renderer.sync(self.world)
+            self.building_renderer.sync(self.world if world is None else world)
         except Exception as exc:
             raise GameStartupError(f"Building renderer sync failed: {exc}") from exc
 
@@ -736,8 +2017,9 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             return
         self._shutdown_complete = True
         try:
-            if hasattr(self, "producer"):
-                self.producer.close()
+            producer = getattr(self, "producer", None)
+            if producer is not None:
+                producer.close()
         finally:
             try:
                 if hasattr(self, "audio"):
@@ -759,7 +2041,7 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Panda3D prototype for the Spider endless swinger"
+        description="Spider Swing - animated third-person Panda3D game"
     )
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument(
@@ -787,18 +2069,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-character", action="store_true")
     parser.add_argument("--no-audio", action="store_true")
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
         "--vision",
         action="store_true",
-        help="use MediaPipe hand gestures instead of keyboard controls",
+        dest="vision",
+        help="use MediaPipe camera gestures (the normal windowed default)",
     )
+    input_group.add_argument(
+        "--keyboard",
+        action="store_false",
+        dest="vision",
+        help="disable the camera and use keyboard + mouse controls",
+    )
+    parser.set_defaults(vision=None)
     parser.add_argument(
         "--camera",
         type=int,
-        default=0,
-        help="OpenCV camera index used with --vision (default: 0)",
+        default=None,
+        help="OpenCV camera index (default: auto-detect)",
     )
-    parser.add_argument("--skip-title", action="store_true")
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="probe capture indices and print the available cameras",
+    )
+    parser.add_argument(
+        "--skip-title",
+        "--skip-tutorial",
+        dest="skip_title",
+        action="store_true",
+        help="skip the front end and start at the 3-2-1 countdown",
+    )
     parser.add_argument(
         "--headless",
         action="store_true",
@@ -816,13 +2118,19 @@ def build_parser() -> argparse.ArgumentParser:
 def config_from_args(args: argparse.Namespace) -> GameConfig:
     if args.frames is not None and args.frames <= 0:
         raise GameStartupError("--frames must be a positive integer")
-    if args.camera < 0:
+    if args.camera is not None and args.camera < 0:
         raise GameStartupError("--camera must be zero or greater")
+    if args.vision is False and args.camera is not None:
+        raise GameStartupError("--camera cannot be used together with --keyboard")
     character_asset = None if args.no_character else _resolved_path(args.character)
     character_manifest: Path | None = None
     if character_asset is not None:
         if args.character_manifest is not None:
             character_manifest = _resolved_path(args.character_manifest)
+
+    # MediaPipe is the primary input path for the actual game. Headless smoke
+    # tests remain camera-free unless --vision is explicitly requested.
+    vision = (not args.headless) if args.vision is None else args.vision
 
     return GameConfig(
         seed=args.seed,
@@ -831,7 +2139,7 @@ def config_from_args(args: argparse.Namespace) -> GameConfig:
         character_asset=character_asset,
         character_manifest=character_manifest,
         audio=not args.no_audio,
-        vision=args.vision,
+        vision=vision,
         camera_index=args.camera,
         skip_title=args.skip_title,
         headless=args.headless,
@@ -844,6 +2152,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         args = build_parser().parse_args(argv)
+        if args.list_cameras:
+            from spidergame.vision import devices
+
+            print("probing capture indices 0-3...")
+            for info in devices.available():
+                flag = "   <-- BLACK FRAMES" if info.dark else ""
+                print(
+                    f"  {info.label()}  brightness "
+                    f"{info.brightness:5.1f}{flag}"
+                )
+            print("\nWindows device list (order does not match capture indices):")
+            for name in devices.system_names():
+                print(f"  {name}")
+            return 0
         config = config_from_args(args)
         require_panda3d()
         validate_building_assets(config.building_asset, config.building_manifest)

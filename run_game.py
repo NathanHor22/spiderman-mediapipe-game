@@ -1,10 +1,15 @@
-"""The game.
+"""Launch the asset-backed 3D game, or the legacy Pygame renderer.
 
-Keyboard by default; `--vision` uses the webcam. Because everything below
-ControlState is input-agnostic, that flag is the only difference between them —
-the physics, the tutorial and the HUD have no idea which is running.
+Panda3D is the default. Pass ``--legacy-renderer`` to keep using the complete
+earlier Pygame implementation below; all remaining arguments are forwarded to
+the selected runner.
 
-  --vision          use the webcam instead of keyboard + mouse
+The primary Panda3D game starts with MediaPipe camera gestures; ``--keyboard``
+selects the mouse-and-keyboard fallback. The legacy renderer keeps its older
+opt-in ``--vision`` flag. Both feed the same swing simulation.
+
+  --vision          explicitly request the normal MediaPipe camera input
+  --keyboard        disable the camera and use keyboard + mouse
   --camera N        start on capture index N (switchable in-game with [ and ])
   --list-cameras    probe the machine's cameras and exit
   --skip-tutorial   go straight to the countdown
@@ -12,8 +17,7 @@ the physics, the tutorial and the HUD have no idea which is running.
   hold SPACE / the web-shooter sign   thwip. One web per press: you must
                                       release before firing another.
   mouse / hand position               which side you anchor to, and how high
-  X (hold)                            preview spider-sense slow motion
-  R  restart      TAB windows      F1 stats      ESC back / quit
+  R  restart      T  training      ESC back / quit
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from collections.abc import Sequence
 
 import pygame
 
@@ -30,9 +35,6 @@ from spidergame.control import ControlState
 from spidergame.game import tuning as T
 from spidergame.game.swing import SwingSim
 from spidergame.producers import KeyboardProducer
-from spidergame.render.actor import draw_web, player_faces
-from spidergame.render.projection import Camera3D
-from spidergame.render.renderer import Renderer
 from spidergame.render.world import WorldStrip
 from spidergame.ui import bgr_to_surface, hud, screens
 
@@ -77,7 +79,14 @@ def _try_camera_switch(current, current_index: int, new_index: int, opener):
     return candidate, new_index, None, True
 
 
-def main() -> int:
+def legacy_main(argv: Sequence[str] | None = None) -> int:
+    """Run the original Pygame renderer."""
+    # Keep the block-based rendering stack out of the primary Panda3D launch.
+    # It is imported only when --legacy-renderer is explicitly requested.
+    from spidergame.render.actor import draw_web, player_faces
+    from spidergame.render.projection import Camera3D
+    from spidergame.render.renderer import Renderer
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--vision", action="store_true")
     ap.add_argument("--camera", type=int, default=None,
@@ -85,7 +94,7 @@ def main() -> int:
     ap.add_argument("--list-cameras", action="store_true")
     ap.add_argument("--skip-tutorial", action="store_true")
     ap.add_argument("--seed", type=int, default=11)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.list_cameras:
         from spidergame.vision import devices
@@ -405,6 +414,23 @@ def main() -> int:
         finally:
             pygame.quit()
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run Panda3D by default, with Pygame available as an explicit fallback."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    use_legacy = "--legacy-renderer" in arguments
+    forwarded = [arg for arg in arguments if arg != "--legacy-renderer"]
+
+    if use_legacy:
+        # Keyboard is already the legacy renderer's default; accept the new
+        # primary-launcher spelling as a harmless compatibility option.
+        forwarded = [arg for arg in forwarded if arg != "--keyboard"]
+        return legacy_main(forwarded)
+
+    from spidergame.render3d.game import main as game_main
+
+    return game_main(forwarded)
 
 
 if __name__ == "__main__":

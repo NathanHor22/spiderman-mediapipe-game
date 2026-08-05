@@ -1,8 +1,8 @@
-"""Launch the optional Panda3D version of the endless swinger.
+"""Launch the Panda3D version of the endless swinger directly.
 
-The existing :mod:`run_game` Pygame runner remains the default game.  This
-entry point is intentionally separate while the real-time 3D asset pipeline is
-being developed.
+The normal ``run_game.py`` launcher now selects this renderer by default. This
+entry point remains as a convenient direct alias; the earlier Pygame renderer
+is available through ``run_game.py --legacy-renderer``.
 """
 
 from __future__ import annotations

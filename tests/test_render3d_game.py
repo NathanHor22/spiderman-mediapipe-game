@@ -2,8 +2,12 @@ import unittest
 from types import SimpleNamespace
 
 from spidergame.render3d.game import (
+    DEFAULT_THWIP_IMAGE,
     GameStartupError,
+    GameState,
     PandaKeyboardProducer,
+    _camera_switch_allowed,
+    _short_camera_message,
     build_parser,
     config_from_args,
     simulation_to_render,
@@ -32,7 +36,50 @@ class Render3DGameHelperTests(unittest.TestCase):
         self.assertEqual((state.hand_x, state.hand_y), (0.5, 0.5))
         self.assertFalse(state.tracking_lost)
 
-    def test_cli_enables_vision_camera_without_character(self):
+    def test_cli_defaults_to_mediapipe_vision(self):
+        args = build_parser().parse_args([])
+
+        config = config_from_args(args)
+
+        self.assertTrue(config.vision)
+        self.assertIsNone(config.camera_index)
+
+    def test_keyboard_flag_is_an_explicit_camera_free_fallback(self):
+        args = build_parser().parse_args(["--keyboard"])
+
+        config = config_from_args(args)
+
+        self.assertFalse(config.vision)
+
+    def test_headless_default_stays_camera_free_for_smoke_tests(self):
+        args = build_parser().parse_args(["--headless"])
+
+        config = config_from_args(args)
+
+        self.assertFalse(config.vision)
+
+    def test_camera_index_cannot_be_combined_with_keyboard_mode(self):
+        args = build_parser().parse_args(["--keyboard", "--camera", "1"])
+
+        with self.assertRaisesRegex(GameStartupError, "keyboard"):
+            config_from_args(args)
+
+    def test_vision_and_keyboard_flags_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["--vision", "--keyboard"])
+
+    def test_camera_switching_is_available_on_every_preview_screen(self):
+        self.assertTrue(_camera_switch_allowed(GameState.TITLE, True))
+        self.assertTrue(_camera_switch_allowed(GameState.TUTORIAL, True))
+        self.assertTrue(_camera_switch_allowed(GameState.SETTINGS, True))
+        self.assertFalse(_camera_switch_allowed(GameState.PLAYING, True))
+        self.assertFalse(_camera_switch_allowed(GameState.TITLE, False))
+
+    def test_supplied_thwip_reference_is_a_bundled_png(self):
+        self.assertTrue(DEFAULT_THWIP_IMAGE.is_file())
+        self.assertEqual(DEFAULT_THWIP_IMAGE.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_vision_flag_remains_compatible_with_old_launch_commands(self):
         args = build_parser().parse_args(
             ["--vision", "--camera", "2", "--no-character", "--no-audio"]
         )
@@ -65,6 +112,27 @@ class Render3DGameHelperTests(unittest.TestCase):
 
         with self.assertRaisesRegex(GameStartupError, "camera"):
             config_from_args(args)
+
+    def test_camera_is_auto_detected_when_index_is_omitted(self):
+        args = build_parser().parse_args([])
+
+        config = config_from_args(args)
+
+        self.assertIsNone(config.camera_index)
+
+    def test_skip_tutorial_alias_enters_the_same_frontend_path(self):
+        args = build_parser().parse_args(["--skip-tutorial"])
+
+        config = config_from_args(args)
+
+        self.assertTrue(config.skip_title)
+
+    def test_long_camera_diagnostic_is_normalized_and_bounded(self):
+        message = _short_camera_message("driver\n  failure " * 20, limit=40)
+
+        self.assertLessEqual(len(message), 40)
+        self.assertNotIn("\n", message)
+        self.assertTrue(message.endswith("..."))
 
 
 if __name__ == "__main__":
