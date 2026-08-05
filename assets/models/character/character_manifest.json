@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "asset": "spider_man.glb",
+  "sha256": "8f56da78230e468141eb35922858308842f278a49429a1199f04d86765bb7428",
+  "character": {
+    "name": "No Way Home Spider-Man",
+    "local_bounds_y_up": {
+      "min": [-7.972505, 0.144041, -1.522176],
+      "max": [7.979485, 20.249125, 3.064332]
+    },
+    "physics_pivot_blender_z_up": [0.0, 0.56, 11.32],
+    "heading_offset_degrees": 180.0
+  },
+  "clips": {
+    "idle": {
+      "name": "idle",
+      "frames": 60,
+      "authored_samples": 60,
+      "fps": 30,
+      "duration_seconds": 2.0,
+      "loop": true,
+      "in_place": true
+    },
+    "fall": {
+      "name": "fall",
+      "frames": 29,
+      "authored_samples": 30,
+      "fps": 30,
+      "duration_seconds": 0.966667,
+      "loop": true,
+      "in_place": true
+    },
+    "shoot": {
+      "name": "shoot",
+      "frames": 15,
+      "authored_samples": 15,
+      "fps": 30,
+      "duration_seconds": 0.5,
+      "loop": false,
+      "in_place": true,
+      "dominant_hand": "right"
+    },
+    "attach": {
+      "name": "attach",
+      "frames": 12,
+      "authored_samples": 12,
+      "fps": 30,
+      "duration_seconds": 0.4,
+      "loop": false,
+      "in_place": true
+    },
+    "swing": {
+      "name": "swing",
+      "frames": 60,
+      "authored_samples": 60,
+      "fps": 30,
+      "duration_seconds": 2.0,
+      "loop": true,
+      "in_place": true,
+      "pose": "two hands overhead with cyclic leg extension and tuck"
+    },
+    "release": {
+      "name": "release",
+      "frames": 17,
+      "authored_samples": 18,
+      "fps": 30,
+      "duration_seconds": 0.566667,
+      "loop": false,
+      "in_place": true
+    }
+  },
+  "joints": {
+    "right_hand": "DEF-hand.R",
+    "left_hand": "DEF-hand.L"
+  },
+  "geometry": {
+    "mesh_nodes": 2,
+    "primitives": 4,
+    "vertices": 25666,
+    "triangles": 46238,
+    "body": {
+      "vertices": 20780,
+      "triangles": 41556
+    },
+    "eyes": {
+      "vertices": 4886,
+      "triangles": 4682
+    }
+  },
+  "skeleton": {
+    "skins": 1,
+    "joints": 73,
+    "exported_bones": "deform-only",
+    "source_rig": "Rigify control rig",
+    "source_rig_bones": 406,
+    "max_vertex_influences": 4,
+    "weights_normalized": true
+  },
+  "materials": {
+    "count": 4,
+    "names": [
+      "Suit_RedBlue",
+      "Suit_BlackAccents",
+      "Eye_Frames",
+      "Eye_Lenses"
+    ],
+    "workflow": "metallic-roughness PBR",
+    "eye_lenses": "non-metallic with subtle emission"
+  },
+  "textures": {
+    "embedded_images": 6,
+    "resolution": [2048, 2048],
+    "color_space": {
+      "base_color": "sRGB",
+      "metallic_roughness": "Non-Color",
+      "normal": "Non-Color"
+    },
+    "images": [
+      "body 1 diffuse",
+      "body 1 metalic-body 1 roughness",
+      "body 1 normal",
+      "body 2 diffuse",
+      "body 2 metalic-body 2 roughness",
+      "body 2 normal"
+    ]
+  },
+  "coordinate_system": {
+    "source": "Blender Z-up, -Y forward",
+    "file": "glTF 2.0 Y-up",
+    "runtime": "Panda3D Z-up, +Y forward",
+    "root_motion": false
+  },
+  "scale": {
+    "asset_rest_height_units": 20.105084,
+    "runtime_target_height": 4.8,
+    "runtime_uniform_scale": true,
+    "verified_gameplay_scale": 0.23906317,
+    "note": "The common Rigify source units are preserved because Panda Actor must sample mesh, inverse binds, constraints, and joints in one space; CharacterController applies the uniform gameplay height."
+  },
+  "optimization": {
+    "excluded": [
+      "Rigify widget meshes",
+      "control and mechanism bones",
+      "drivers and constraints",
+      "embedded rig UI script",
+      "unused materials",
+      "unused images"
+    ],
+    "animation_channels_per_clip": 219,
+    "glb_bytes": 8730984
+  },
+  "provenance": {
+    "source_file": "No Way Home spider-man.blend",
+    "source_kind": "user-provided archive",
+    "original_untouched": true,
+    "working_copy": true,
+    "build_tool": "Blender 5.0.1, factory startup, auto-execution disabled",
+    "license": {
+      "status": "unresolved",
+      "notice": "No license or attribution file was present with the supplied source. Confirm redistribution rights before publishing this asset."
+    }
+  }
+}

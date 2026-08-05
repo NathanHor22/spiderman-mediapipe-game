@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "asset": "new_york_generic.glb",
+  "format": "glTF 2.0 binary (GLB)",
+  "size_bytes": 14010944,
+  "sha256": "7e7a7467e80e7eb43615f91a8527d78642079b0613ed3a413cb235e4cf915f3f",
+  "root_node": "NY_Generic_Buildings_40x",
+  "coordinate_system": {
+    "up": "+Y",
+    "forward": "-Z",
+    "units": "game world units",
+    "node_transforms": "identity",
+    "origin": "center of footprint at ground level",
+    "source_glb": "glTF uses X=width, Y=up, Z=back (forward is -Z); local_bounds_y_up is stored in these axes.",
+    "panda_runtime": "Panda uses X=width, Y=forward/depth, Z=up; bounds is converted from glTF with [x, y, z] -> [x, -z, y]."
+  },
+  "normalization": {
+    "source_units": "Blender meters",
+    "game_units_per_source_meter": 40.0,
+    "reason": "At 40x the generic footprints are about 15-52 units across/deep and heights are 44-166 units, matching the existing 18-34 by 20-40 procedural footprints and 72-132 unit skyline while retaining low-rise variety."
+  },
+  "optimization": {
+    "landmarks_excluded": true,
+    "cameras_lights_and_animation_excluded": true,
+    "transforms_applied": true,
+    "textures_embedded_once": true,
+    "texture_max_dimension": 1024,
+    "mesh_nodes": 12,
+    "materials": 12,
+    "unique_textures": 11,
+    "triangles": 288
+  },
+  "provenance": {
+    "source_archive": "new-york-buildings.zip",
+    "source_archive_sha256": "1942eaa5b26ce4cfc7165ad733782cd81341b6e574e60c9f306960d6b7a67e75",
+    "source_entry": "source/New_york_buildings.blend",
+    "source_blender_version": "2.93.20",
+    "exported_with": "Blender 5.0.1",
+    "source_was_not_modified": true
+  },
+  "license": {
+    "status": "unresolved",
+    "note": "The supplied archive contains no license, README, credits, or attribution file. Confirm usage and redistribution rights before publishing this derived GLB."
+  },
+  "textures": [
+    {"name": "1", "source_size": [1871, 2091], "runtime_size": [916, 1024]},
+    {"name": "3", "source_size": [2461, 1896], "runtime_size": [1024, 789]},
+    {"name": "4", "source_size": [1228, 900], "runtime_size": [1024, 750]},
+    {"name": "5", "source_size": [1199, 1238], "runtime_size": [992, 1024]},
+    {"name": "common", "source_size": [426, 517], "runtime_size": [426, 517]},
+    {"name": "common_buildings", "source_size": [1325, 1156], "runtime_size": [1024, 893]},
+    {"name": "faltiron", "source_size": [622, 821], "runtime_size": [622, 821]},
+    {"name": "glass", "source_size": [1198, 3376], "runtime_size": [363, 1024]},
+    {"name": "metlife", "source_size": [620, 1318], "runtime_size": [482, 1024]},
+    {"name": "tower-one", "source_size": [827, 2287], "runtime_size": [370, 1024]},
+    {"name": "triangle", "source_size": [1640, 1552], "runtime_size": [1024, 969]}
+  ],
+  "nodes": [
+    {
+      "name": "b1",
+      "category": "brick",
+      "height": 53.236027,
+      "local_bounds_y_up": {"min": [-7.742568, 0.0, -7.742584], "max": [7.742568, 53.236027, 7.742569]},
+      "bounds": {"min": [-7.742568, -7.742569, 0.0], "max": [7.742568, 7.742584, 53.236027]},
+      "triangles": 12,
+      "material": "Material.011",
+      "texture": "common"
+    },
+    {
+      "name": "b2",
+      "category": "brick",
+      "height": 43.651882,
+      "local_bounds_y_up": {"min": [-11.599545, 0.0, -20.065659], "max": [11.599545, 43.651882, 20.065659]},
+      "bounds": {"min": [-11.599545, -20.065659, 0.0], "max": [11.599545, 20.065659, 43.651882]},
+      "triangles": 56,
+      "material": "Material.012",
+      "texture": "faltiron"
+    },
+    {
+      "name": "b3",
+      "category": "brick",
+      "height": 49.23362,
+      "local_bounds_y_up": {"min": [-8.62077, 0.0, -13.400208], "max": [8.62077, 49.23362, 13.400208]},
+      "bounds": {"min": [-8.62077, -13.400208, 0.0], "max": [8.62077, 13.400208, 49.23362]},
+      "triangles": 28,
+      "material": "Material.013",
+      "texture": "4"
+    },
+    {
+      "name": "b4",
+      "category": "brick",
+      "height": 71.461189,
+      "local_bounds_y_up": {"min": [-9.823544, 0.0, -19.798721], "max": [9.823544, 71.461189, 19.798706]},
+      "bounds": {"min": [-9.823544, -19.798706, 0.0], "max": [9.823544, 19.798721, 71.461189]},
+      "triangles": 36,
+      "material": "Material.014",
+      "texture": "1"
+    },
+    {
+      "name": "b5",
+      "category": "brick",
+      "height": 44.517609,
+      "local_bounds_y_up": {"min": [-9.387074, 0.0, -26.143616], "max": [9.387074, 44.517609, 26.143646]},
+      "bounds": {"min": [-9.387074, -26.143646, 0.0], "max": [9.387074, 26.143616, 44.517609]},
+      "triangles": 12,
+      "material": "Material.015",
+      "texture": "5"
+    },
+    {
+      "name": "b6",
+      "category": "brick",
+      "height": 73.375824,
+      "local_bounds_y_up": {"min": [-15.670223, 0.0, -22.282417], "max": [15.670223, 73.375824, 22.282417]},
+      "bounds": {"min": [-15.670223, -22.282417, 0.0], "max": [15.670223, 22.282417, 73.375824]},
+      "triangles": 20,
+      "material": "Material.016",
+      "texture": "3"
+    },
+    {
+      "name": "g1",
+      "category": "glass",
+      "height": 127.91967,
+      "local_bounds_y_up": {"min": [-11.122215, 0.0, -11.122219], "max": [11.122215, 127.91967, 11.122219]},
+      "bounds": {"min": [-11.122215, -11.122219, 0.0], "max": [11.122215, 11.122219, 127.91967]},
+      "triangles": 12,
+      "material": "Material.005",
+      "texture": "glass"
+    },
+    {
+      "name": "g2",
+      "category": "glass",
+      "height": 166.364197,
+      "local_bounds_y_up": {"min": [-11.437103, 0.0, -11.684381], "max": [11.437103, 166.364197, 11.684381]},
+      "bounds": {"min": [-11.437103, -11.684381, 0.0], "max": [11.437103, 11.684381, 166.364197]},
+      "triangles": 18,
+      "material": "Material.006",
+      "texture": "triangle"
+    },
+    {
+      "name": "g3",
+      "category": "glass",
+      "height": 146.576889,
+      "local_bounds_y_up": {"min": [-12.459015, 0.0, -12.459009], "max": [12.459015, 146.576889, 12.459009]},
+      "bounds": {"min": [-12.459015, -12.459009, 0.0], "max": [12.459015, 12.459009, 146.576889]},
+      "triangles": 44,
+      "material": "Material.007",
+      "texture": "metlife"
+    },
+    {
+      "name": "g4",
+      "category": "glass",
+      "height": 79.999992,
+      "local_bounds_y_up": {"min": [-15.659332, 0.0, -15.659321], "max": [15.659302, 79.999992, 15.659321]},
+      "bounds": {"min": [-15.659332, -15.659321, 0.0], "max": [15.659302, 15.659321, 79.999992]},
+      "triangles": 12,
+      "material": "Material.008",
+      "texture": "common_buildings"
+    },
+    {
+      "name": "g5",
+      "category": "glass",
+      "height": 112.39312,
+      "local_bounds_y_up": {"min": [-17.798584, 0.0, -11.713181], "max": [17.798615, 112.39312, 11.713181]},
+      "bounds": {"min": [-17.798584, -11.713181, 0.0], "max": [17.798615, 11.713181, 112.39312]},
+      "triangles": 12,
+      "material": "Material.009",
+      "texture": "tower-one"
+    },
+    {
+      "name": "g6",
+      "category": "glass",
+      "height": 141.176712,
+      "local_bounds_y_up": {"min": [-11.437103, 0.0, -12.476503], "max": [11.437103, 141.176712, 12.476503]},
+      "bounds": {"min": [-11.437103, -12.476503, 0.0], "max": [11.437103, 12.476503, 141.176712]},
+      "triangles": 26,
+      "material": "Material.010",
+      "texture": "glass"
+    }
+  ]
+}

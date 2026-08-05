@@ -3,8 +3,10 @@ __pycache__/
 .venv/
 venv/
 
-# Downloaded on first run by spidergame/vision/models.py
-models/
+# Downloaded on first run by spidergame/vision/models.py.  Keep this anchored
+# to the repository root so checked-in runtime art under assets/models remains
+# visible to Git.
+/models/
 
 # Per-machine, per-player thresholds — deliberately not shared
 calibration.json

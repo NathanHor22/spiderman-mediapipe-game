@@ -28,13 +28,50 @@ pip install -r requirements.txt
 
 The hand landmarker model (~8MB) downloads automatically on first run.
 
+### Panda3D asset-backed path
+
+The third-person asset-backed renderer has a separate entry point:
+
+```
+python run_game_3d.py
+python run_game_3d.py --vision --camera 0
+```
+
+It uses the existing `SwingSim`, anchor selection, gesture producer and
+procedural sound system, but renders twelve instanced, textured New York
+building variants and an optimized rigged character through Panda3D instead of
+`render/renderer.py`. The character includes in-place `idle`, `fall`, `shoot`,
+`attach`, `swing` and `release` clips. Swing pose progress is scrubbed from the
+physics cable arc, while the simulation remains the only owner of world motion;
+animation therefore cannot send the character into an extra orbit. The web is
+drawn from whichever animated wrist is closest to the selected anchor. The
+bundled runtime character is an 8.7MB GLB with 46,238 triangles, 73 deform
+joints, four-weight skinning and six embedded packed PBR textures.
+
+Use `--character path/to/hero.glb` for another animated GLB. Its six clips must
+use the names above; an adjacent `character_manifest.json` can supply clip
+aliases, a physics pivot and exact hand-joint names. Pass
+`--character-manifest path/to/hero.json` to use a different manifest filename.
+If an asset is missing or incompatible, the runner reports the reason and uses
+the tall red-and-blue placeholder. The original Pygame runner remains available
+as a fallback.
+
+For a non-interactive smoke test:
+
+```
+python run_game_3d.py --headless --frames 5 --skip-title --no-audio --no-character
+```
+
+The supplied building and character archives did not contain license or
+attribution files. Their runtime GLBs are suitable for local development, but
+confirm the original asset licenses before publishing or redistributing them.
+
 ## What runs today
 
-Everything is pygame, including the diagnostic tools. `cv2.imshow` has no sound,
-no real event handling and its own frame pacing, so tools built on it drift away
-from how the game actually behaves — which defeats the point of a tool you use
-to judge whether the game feels right. OpenCV is now only used for camera
-capture and colour conversion.
+The original runner and diagnostic tools use Pygame; the asset-backed runner
+uses Panda3D. Neither path uses `cv2.imshow`, which has no sound, no real event
+handling and its own frame pacing. OpenCV is only used for camera capture and
+colour conversion.
 
 **`python run_game.py`** — the game. Keyboard by default; `--vision` swaps in the
 webcam and nothing else changes.
@@ -160,6 +197,10 @@ spidergame/
     renderer.py         painter's algorithm, flat shading, fog
     actor.py            player figure and web line
     palette.py          colours, fog, and the colour-codes-the-verb rule
+  render3d/
+    buildings.py        Panda3D GLB instancing over logical building proxies
+    character.py        Actor clips, physics-driven states and wrist sockets
+    game.py             3D loop, camera, UI, road, web and input adapters
   ui/
     surface.py          camera frames -> pygame surfaces
     hud.py              text, meters, panels
