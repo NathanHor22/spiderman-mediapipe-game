@@ -35,6 +35,7 @@ from spidergame.render3d.settings import (
     SettingsMenu,
     SettingsRow,
 )
+from spidergame.render3d import buttonart
 from spidergame.render3d.tutorial import (
     Countdown,
     MenuIntent,
@@ -88,6 +89,25 @@ DEFAULT_CHARACTER_MANIFEST = (
     PROJECT_ROOT / "assets" / "models" / "character" / "character_manifest.json"
 )
 DEFAULT_THWIP_IMAGE = PROJECT_ROOT / "assets" / "ui" / "spider-man-thwip.png"
+
+# Menu plates. The previous title buttons were 11:1 letterboxes with their text
+# baseline pinned to the plate centre, which read as both squashed and floating
+# high. These proportions match the reference artwork, and every label is
+# positioned by buttonart.TEXT_VCENTER rather than a per-button magic number.
+TITLE_BUTTON_SCALE = 0.050
+TITLE_BUTTON_HALF_W = 9.4
+TITLE_BUTTON_HALF_H = 1.35
+# Four plates plus a 0.135 plate height has to clear the control-help block
+# that starts at -0.30, or QUIT lands on top of it.
+TITLE_BUTTON_TOP = 0.34
+TITLE_BUTTON_STEP = 0.165
+TITLE_TEXT_SCALE = 1.25
+TITLE_PLATE_PIXELS = (448, 64)
+
+SETTINGS_WIDE_PLATE = (448, 64)
+SETTINGS_ARROW_PLATE = (72, 104)
+SETTINGS_BUTTON_TEXT = 0.040
+SETTINGS_ARROW_TEXT = 0.052
 
 PLAYER_HEIGHT = 4.8
 CAMERA_BACK = 18.0
@@ -725,15 +745,26 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             **common,
         )
         self.title_buttons: list[Any] = []
+        self._title_button_art: list[bool] = []
         for index, label in enumerate(self.title_menu.labels):
+            texture, draws_text = buttonart.button_art(
+                label, *TITLE_PLATE_PIXELS, active=False
+            )
             button = DirectButton(
                 parent=self.aspect2d,
-                text=label,
-                pos=(menu_x, 0.0, 0.29 - index * 0.13),
-                scale=0.050,
-                frameSize=(-9.4, 9.4, -0.82, 0.82),
-                frameColor=(0.05, 0.07, 0.14, 0.96),
-                text_fg=(0.82, 0.87, 0.98, 1.0),
+                text="" if not draws_text else label,
+                pos=(menu_x, 0.0, TITLE_BUTTON_TOP - index * TITLE_BUTTON_STEP),
+                scale=TITLE_BUTTON_SCALE,
+                frameSize=(-TITLE_BUTTON_HALF_W, TITLE_BUTTON_HALF_W,
+                           -TITLE_BUTTON_HALF_H, TITLE_BUTTON_HALF_H),
+                # The plate is the artwork; the frame only has to exist so the
+                # button keeps a mouse region for hover and clicks.
+                frameColor=(0.0, 0.0, 0.0, 0.0),
+                image=texture,
+                image_scale=(TITLE_BUTTON_HALF_W, 1.0, TITLE_BUTTON_HALF_H),
+                text_scale=TITLE_TEXT_SCALE,
+                text_pos=(0.0, buttonart.TEXT_VCENTER * TITLE_TEXT_SCALE),
+                text_fg=buttonart.TEXT_IDLE,
                 text_shadow=(0.01, 0.01, 0.02, 0.9),
                 relief=DGG.FLAT,
                 rolloverSound=None,
@@ -743,6 +774,7 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             )
             button.bind(DGG.ENTER, self._hover_title_button, [index])
             self.title_buttons.append(button)
+            self._title_button_art.append(draws_text)
         control_help = (
             "AIM       Move your hand left or right\n"
             "THWIP     Index + pinky out; curl middle + ring\n"
@@ -959,15 +991,18 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             fg=(0.48, 0.58, 0.76, 1.0),
             **common,
         )
+        arrow_plate = buttonart.plate_texture(*SETTINGS_ARROW_PLATE, active=False)
         self.settings_prev_button = DirectButton(
             parent=self.aspect2d,
             text="<",
             pos=(settings_x - 0.59, 0.0, 0.16),
             frameSize=(-0.085, 0.085, -0.13, 0.13),
-            frameColor=(0.08, 0.11, 0.22, 0.98),
-            text_fg=(0.96, 0.97, 1.0, 1.0),
-            text_scale=0.052,
-            text_pos=(0.0, -0.018),
+            frameColor=(0.0, 0.0, 0.0, 0.0),
+            image=arrow_plate,
+            image_scale=(0.085, 1.0, 0.13),
+            text_fg=buttonart.TEXT_ACTIVE,
+            text_scale=SETTINGS_ARROW_TEXT,
+            text_pos=(0.0, buttonart.TEXT_VCENTER * SETTINGS_ARROW_TEXT),
             relief=DGG.FLAT,
             rolloverSound=None,
             clickSound=None,
@@ -979,10 +1014,12 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             text=">",
             pos=(settings_x + 0.59, 0.0, 0.16),
             frameSize=(-0.085, 0.085, -0.13, 0.13),
-            frameColor=(0.08, 0.11, 0.22, 0.98),
-            text_fg=(0.96, 0.97, 1.0, 1.0),
-            text_scale=0.052,
-            text_pos=(0.0, -0.018),
+            frameColor=(0.0, 0.0, 0.0, 0.0),
+            image=arrow_plate,
+            image_scale=(0.085, 1.0, 0.13),
+            text_fg=buttonart.TEXT_ACTIVE,
+            text_scale=SETTINGS_ARROW_TEXT,
+            text_pos=(0.0, buttonart.TEXT_VCENTER * SETTINGS_ARROW_TEXT),
             relief=DGG.FLAT,
             rolloverSound=None,
             clickSound=None,
@@ -998,29 +1035,39 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
             wordwrap=42,
             **common,
         )
+        apply_texture, apply_text = buttonart.button_art(
+            "APPLY CAMERA", *SETTINGS_WIDE_PLATE, active=True
+        )
         self.settings_apply_button = DirectButton(
             parent=self.aspect2d,
-            text="APPLY CAMERA",
-            pos=(settings_x, 0.0, -0.20),
-            frameSize=(-0.52, 0.52, -0.058, 0.058),
-            frameColor=(0.72, 0.04, 0.08, 0.98),
-            text_fg=(1.0, 1.0, 1.0, 1.0),
-            text_scale=0.040,
-            text_pos=(0.0, -0.014),
+            text="APPLY CAMERA" if apply_text else "",
+            pos=(settings_x, 0.0, -0.21),
+            frameSize=(-0.52, 0.52, -0.075, 0.075),
+            frameColor=(0.0, 0.0, 0.0, 0.0),
+            image=apply_texture,
+            image_scale=(0.52, 1.0, 0.075),
+            text_fg=buttonart.TEXT_ACTIVE,
+            text_scale=SETTINGS_BUTTON_TEXT,
+            text_pos=(0.0, buttonart.TEXT_VCENTER * SETTINGS_BUTTON_TEXT),
             relief=DGG.FLAT,
             rolloverSound=None,
             clickSound=None,
             command=self._activate_settings_apply,
         )
+        back_texture, back_text = buttonart.button_art(
+            "BACK TO MENU", *SETTINGS_WIDE_PLATE, active=False
+        )
         self.settings_back_button = DirectButton(
             parent=self.aspect2d,
-            text="BACK TO MENU",
-            pos=(settings_x, 0.0, -0.35),
-            frameSize=(-0.52, 0.52, -0.058, 0.058),
-            frameColor=(0.05, 0.07, 0.14, 0.98),
-            text_fg=(0.76, 0.82, 0.94, 1.0),
-            text_scale=0.040,
-            text_pos=(0.0, -0.014),
+            text="BACK TO MENU" if back_text else "",
+            pos=(settings_x, 0.0, -0.39),
+            frameSize=(-0.52, 0.52, -0.075, 0.075),
+            frameColor=(0.0, 0.0, 0.0, 0.0),
+            image=back_texture,
+            image_scale=(0.52, 1.0, 0.075),
+            text_fg=buttonart.TEXT_IDLE,
+            text_scale=SETTINGS_BUTTON_TEXT,
+            text_pos=(0.0, buttonart.TEXT_VCENTER * SETTINGS_BUTTON_TEXT),
             relief=DGG.FLAT,
             rolloverSound=None,
             clickSound=None,
@@ -1028,7 +1075,8 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
         )
         self.settings_status = OnscreenText(
             text="",
-            pos=(settings_x, -0.50),
+            # Clear of BACK TO MENU, whose plate now reaches -0.465.
+            pos=(settings_x, -0.55),
             scale=0.028,
             align=TextNode.ACenter,
             fg=(0.55, 0.68, 0.90, 1.0),
@@ -1195,16 +1243,30 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
     def _refresh_title_menu(self) -> None:
         for index, button in enumerate(self.title_buttons):
             selected = index == self.title_menu.selected
-            button["frameColor"] = (
-                (0.72, 0.04, 0.08, 0.98)
-                if selected
-                else (0.05, 0.07, 0.14, 0.96)
-            )
-            button["text_fg"] = (
-                (1.0, 1.0, 1.0, 1.0)
-                if selected
-                else (0.72, 0.79, 0.92, 1.0)
-            )
+            label = self.title_menu.labels[index]
+            # Selection now reads on the plate itself rather than on a frame
+            # colour hidden behind it.
+            if self._title_button_art[index]:
+                # Generated plate: swap to the brighter variant and lift the
+                # live text.
+                texture, _ = buttonart.button_art(
+                    label, *TITLE_PLATE_PIXELS, active=selected
+                )
+                button["image"] = texture
+                button["image_scale"] = (
+                    TITLE_BUTTON_HALF_W, 1.0, TITLE_BUTTON_HALF_H
+                )
+                button["text_fg"] = (
+                    buttonart.TEXT_ACTIVE if selected else buttonart.TEXT_IDLE
+                )
+                button.clearColorScale()
+            else:
+                # Supplied artwork is a single fixed image, so selection has to
+                # read as a brightness change over it or the menu would give no
+                # feedback at all.
+                button.setColorScale(
+                    (1.0, 1.0, 1.0, 1.0) if selected else (0.58, 0.58, 0.66, 1.0)
+                )
 
     def _hover_title_button(self, index: int, *_event: Any) -> None:
         if self.state is GameState.TITLE:
