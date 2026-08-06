@@ -40,6 +40,10 @@ class FakeAudio:
         self.handles = 0
         self.stops = 0
         self.closed = 0
+        self.falls = 0
+        self.music_playing = False
+        self.music_starts = 0
+        self.music_stops = 0
         self.__class__.instances.append(self)
 
     def handle(self, events, sim):
@@ -47,6 +51,19 @@ class FakeAudio:
 
     def stop(self, *args, **kwargs):
         self.stops += 1
+
+    def play_fall(self):
+        self.falls += 1
+
+    def play_menu_music(self, *args, **kwargs):
+        if not self.music_playing:
+            self.music_starts += 1
+        self.music_playing = True
+
+    def stop_music(self, *args, **kwargs):
+        if self.music_playing:
+            self.music_stops += 1
+        self.music_playing = False
 
     def close(self):
         self.closed += 1

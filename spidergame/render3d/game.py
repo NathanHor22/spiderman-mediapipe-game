@@ -269,9 +269,23 @@ class _SilentSoundSystem:
 
     enabled = False
     error = "audio disabled"
+    music_playing = False
+    loaded_assets: tuple[str, ...] = ()
 
     def handle(self, _events: Any, _sim: Any = None) -> None:
         pass
+
+    def update(self, _sim: Any) -> None:
+        pass
+
+    def play_fall(self) -> None:
+        pass
+
+    def play_menu_music(self, fade_ms: int = 900) -> None:
+        del fade_ms
+
+    def stop_music(self, fade_ms: int = 600) -> None:
+        del fade_ms
 
     def stop(self, fade_ms: int = 80) -> None:
         del fade_ms
@@ -1231,6 +1245,7 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
     def _set_state(self, state: GameState, *, reset: bool = False) -> None:
         if reset:
             self._reset_run()
+        previous = self.state
         self.state = state
         loading = state is GameState.LOADING
         title = state is GameState.TITLE
@@ -1239,6 +1254,17 @@ class SpiderGame3D(ShowBase):  # type: ignore[misc]
         countdown = state is GameState.COUNTDOWN
         playing = state is GameState.PLAYING
         dead = state is GameState.DEAD
+
+        # Theme carries the menus and fades once the countdown begins, so play
+        # starts on the swing cues alone. Both calls are idempotent, and the
+        # impact cue is on a channel stop() leaves alone so it survives the
+        # cleanup that dying triggers.
+        if title or tutorial or settings:
+            self.audio.play_menu_music()
+        else:
+            self.audio.stop_music()
+        if dead and previous is not GameState.DEAD:
+            self.audio.play_fall()
 
         loading_nodes = (
             self.loading_panel,

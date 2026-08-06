@@ -278,6 +278,13 @@ def legacy_main(argv: Sequence[str] | None = None) -> int:
         else:
             clock.exit_slowmo()
 
+        # Theme plays over the menus and fades as the countdown starts, so play
+        # begins on the swing cues alone. Both calls are idempotent.
+        if state in (TITLE, TUTORIAL):
+            audio.play_menu_music()
+        else:
+            audio.stop_music()
+
         cam_surface = None
         if args.vision and state in (TITLE, TUTORIAL):
             frame, _ = producer.worker.debug_frame()
@@ -314,6 +321,7 @@ def legacy_main(argv: Sequence[str] | None = None) -> int:
                 best_distance = max(best_distance, sim.z)
                 if not sim.alive:
                     audio.stop()
+                    audio.play_fall()
                     state = DEAD
 
             lag = min(1.0, T.CAMERA_LAG * dt) if dt > 0 else 0.0

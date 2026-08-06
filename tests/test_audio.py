@@ -5,13 +5,18 @@ from types import SimpleNamespace
 import pygame
 
 from spidergame.audio import (
+    ASSET_DIR,
     CABLE_CHANNEL,
+    IMPACT_CHANNEL,
     MOTION_CHANNEL,
+    MUSIC_MENU,
     OUTPUT_CHANNELS,
     SAMPLE_RATE,
     SHOT_CHANNEL,
+    SOUND_FILES,
     SoundSystem,
     _build_pcm_bank,
+    trim_silence,
 )
 from spidergame.game.swing import SwingEvent
 
@@ -104,7 +109,10 @@ class ProceduralPcmTests(unittest.TestCase):
         first = _build_pcm_bank()
         second = _build_pcm_bank()
 
-        self.assertEqual(first.keys(), {"shot", "attach", "miss", "release", "whoosh"})
+        self.assertEqual(
+            first.keys(),
+            {"shot", "attach", "miss", "release", "whoosh", "impact"},
+        )
         self.assertEqual(first, second)
         for pcm in first.values():
             self.assertEqual(len(pcm) % (OUTPUT_CHANNELS * 2), 0)
@@ -123,9 +131,12 @@ class SoundSystemTests(unittest.TestCase):
 
         self.assertTrue(audio.enabled)
         self.assertEqual(len(mixer.init_calls), 1)
-        self.assertEqual(mixer.num_channels, 3)
-        self.assertEqual(mixer.reserved, 3)
-        self.assertEqual(set(mixer.channels), {SHOT_CHANNEL, CABLE_CHANNEL, MOTION_CHANNEL})
+        self.assertEqual(mixer.num_channels, 4)
+        self.assertEqual(mixer.reserved, 4)
+        self.assertEqual(
+            set(mixer.channels),
+            {SHOT_CHANNEL, CABLE_CHANNEL, MOTION_CHANNEL, IMPACT_CHANNEL},
+        )
 
     def test_mixer_failure_degrades_to_safe_silence(self):
         mixer = FakeMixer(ready=False, fail=True)
@@ -188,16 +199,117 @@ class SoundSystemTests(unittest.TestCase):
 
         self.assertIn(90, mixer.channels[MOTION_CHANNEL].fadeouts)
 
+    def test_fall_impact_survives_the_stop_that_death_triggers(self):
+        # The death transition calls stop() and then play_fall(). If the impact
+        # shared a channel with the swing cues, the cleanup for dying would cut
+        # off the sound of dying.
+        mixer = FakeMixer()
+        audio = SoundSystem(mixer=mixer)
+
+        audio.stop()
+        audio.play_fall()
+
+        impact = mixer.channels[IMPACT_CHANNEL]
+        self.assertEqual(len(impact.plays), 1)
+        self.assertEqual(impact.fadeouts, [])
+        self.assertTrue(impact.get_busy())
+
+    def test_fake_mixer_never_touches_recorded_assets(self):
+        # Injected mixers have no decoder, so tests must stay on the
+        # synthesised bank or their buffer assertions become meaningless.
+        mixer = FakeMixer()
+        audio = SoundSystem(mixer=mixer)
+
+        self.assertEqual(audio.loaded_assets, [])
+        self.assertFalse(audio.music_playing)
+        audio.play_menu_music()
+        self.assertFalse(audio.music_playing)
+
+    def test_shipped_audio_assets_are_present(self):
+        for filename in (*SOUND_FILES.values(), MUSIC_MENU):
+            with self.subTest(filename=filename):
+                path = ASSET_DIR / filename
+                self.assertTrue(path.is_file(), f"missing {path}")
+                self.assertGreater(path.stat().st_size, 1024)
+
+    def test_trim_silence_crops_leading_and_trailing_dead_air(self):
+        # Mirrors the supplied web-swing.mp3: a burst buried after a long
+        # silent lead-in, which would otherwise never be reached before the
+        # next swing replaced it on the channel.
+        rate = SAMPLE_RATE
+        quiet = [0, 0] * rate                     # 1.0s of silence
+        burst = [20_000, -20_000] * (rate // 5)   # 0.2s of signal
+        raw = array("h", quiet + burst + quiet).tobytes()
+
+        trimmed = trim_silence(raw)
+        frames = len(trimmed) // (OUTPUT_CHANNELS * 2)
+        duration = frames / rate
+
+        self.assertLess(duration, 0.45, "dead air survived the trim")
+        self.assertGreater(duration, 0.18, "trim ate the actual sound")
+
+        # Audible within the first 60ms — the deliberate lead-in and de-click
+        # fade account for roughly the first 20.
+        head = array("h")
+        head.frombytes(trimmed[: OUTPUT_CHANNELS * 2 * (rate * 60 // 1000)])
+        self.assertTrue(any(head), "audible content should start immediately")
+
+    def test_trim_silence_leaves_tight_and_silent_buffers_alone(self):
+        tight = array("h", [15_000, -15_000] * (SAMPLE_RATE // 10)).tobytes()
+        self.assertEqual(trim_silence(tight), tight)
+
+        silent = array("h", [0, 0] * (SAMPLE_RATE // 10)).tobytes()
+        self.assertEqual(trim_silence(silent), silent)
+
+        self.assertEqual(trim_silence(b""), b"")
+
+    def test_silent_stub_matches_the_real_sound_system_interface(self):
+        # The 3D runner swaps in _SilentSoundSystem for --no-audio and headless
+        # runs. Any public method added here that it lacks is an AttributeError
+        # at runtime in exactly the configuration nobody tests interactively.
+        from spidergame.render3d.game import _SilentSoundSystem
+
+        expected = {
+            name for name in vars(SoundSystem)
+            if callable(getattr(SoundSystem, name)) and not name.startswith("_")
+        }
+        missing = expected - set(dir(_SilentSoundSystem))
+        self.assertEqual(missing, set(), f"silent stub missing {missing}")
+
+        stub = _SilentSoundSystem()
+        args = {"handle": ((), swinging_sim()), "update": (swinging_sim(),)}
+        for name in sorted(expected):
+            with self.subTest(method=name):
+                getattr(stub, name)(*args.get(name, ()))
+
+    def test_impact_has_a_synthesised_fallback(self):
+        bank = _build_pcm_bank()
+        self.assertIn("impact", bank)
+        samples = array("h")
+        samples.frombytes(bank["impact"])
+        self.assertTrue(any(samples), "impact fallback is silent")
+
     def test_stop_can_fade_or_stop_immediately(self):
         mixer = FakeMixer()
         audio = SoundSystem(mixer=mixer)
 
+        # The impact channel is excluded by design — see play_fall().
+        swing_channels = [mixer.channels[i] for i in
+                          (SHOT_CHANNEL, CABLE_CHANNEL, MOTION_CHANNEL)]
+
         audio.stop(55)
-        for channel in mixer.channels.values():
+        for channel in swing_channels:
             self.assertEqual(channel.fadeouts, [55])
+        self.assertEqual(mixer.channels[IMPACT_CHANNEL].fadeouts, [])
+
         audio.stop(0)
-        for channel in mixer.channels.values():
+        for channel in swing_channels:
             self.assertEqual(channel.stops, 1)
+        self.assertEqual(mixer.channels[IMPACT_CHANNEL].stops, 0)
+
+        # close() is the one path that must silence everything.
+        audio.close()
+        self.assertEqual(mixer.channels[IMPACT_CHANNEL].stops, 1)
 
 
 if __name__ == "__main__":
